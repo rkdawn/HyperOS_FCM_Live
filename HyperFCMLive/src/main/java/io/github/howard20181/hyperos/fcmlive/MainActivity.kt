@@ -546,18 +546,10 @@ class MainActivity : AppCompatActivity() {
             ThemeSupport.reapplyWindow(this)
             appliedPalette = palette
         }
-        // Silent rescan on every resume. The allowlist can change only while
-        // this screen is covered (About: import, strict mode; Experiment:
-        // keepalive switches) or outside the app (another device pushed? no —
-        // the prefs are local; a module edit through LSPosed's own UI). Either
-        // way the list on return is stale until a scan refreshes it, and the
-        // scan is cheap relative to how rarely resume fires. `refreshing`
-        // drives the top hairline, so the user sees the sweep instead of
-        // needing to know a gesture exists.
-        if (packagesReady && !refreshing) {
-            refreshing = true
-            loadApps()
-        }
+        // No rescan here. The refresh gesture is the only manual entry, and
+        // the stock behaviour covers the rest: the allowlist re-syncs through
+        // the Xposed service callback and after every list edit, so the list
+        // on return from settings is already current without a scan.
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
