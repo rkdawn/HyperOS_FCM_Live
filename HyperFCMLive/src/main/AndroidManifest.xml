@@ -58,6 +58,9 @@
             android:name=".AboutActivity"
             android:exported="false" />
         <activity
+            android:name=".FcmDiagnosticsActivity"
+            android:exported="false" />
+        <activity
             android:name=".ExperimentActivity"
             android:exported="false" />
         <activity

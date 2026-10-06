@@ -271,7 +271,9 @@ class MainActivity : AppCompatActivity() {
                         onToggleShowFcmOnly = { toggleOverflowShowFcmOnly() },
                         onToggleExcludeMiPush = { toggleOverflowExcludeMiPush() },
                         onToggleStrictMode = { toggleOverflowStrictMode() },
-                        onDiagnostics = { openFcmDiagnostics() }
+                        onDiagnostics = {
+                            startActivity(Intent(this, FcmDiagnosticsActivity::class.java))
+                        }
                     ),
                     // The field reads the query from this state, so no view
                     // hand-off is needed: whatever currentQuery holds when the

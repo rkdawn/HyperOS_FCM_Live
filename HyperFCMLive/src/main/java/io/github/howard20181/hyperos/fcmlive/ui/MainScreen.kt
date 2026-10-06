@@ -10,6 +10,7 @@ import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -62,6 +63,8 @@ import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshState
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -77,10 +80,12 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.platform.LocalDensity
@@ -183,6 +188,11 @@ fun MainScreen(
     // messages originate; hosted here, because this is the tree on screen.
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() }
 ) {
+    // The pull's own progress: 0 at rest, 1 at the commit threshold, >1 past
+    // it. Only read for visuals — the gesture itself belongs to
+    // PullToRefreshBox above.
+    val pullState = rememberPullToRefreshState()
+
     // A finished refresh puts the list back at the top.
     //
     // The scan re-sorts: checked apps first, everything else alphabetically. A
@@ -226,14 +236,14 @@ fun MainScreen(
     ) { innerPadding ->
         // The gesture is back, the ring is not: PullToRefreshBox carries the
         // nested-scroll handshake (list must be at the very top, pull past the
-        // threshold, release) and fires [onRefresh], while the only visual it
-        // draws is a hairline's clip container — the sweep itself is [RefreshLine]
-        // below, so nothing appears during the pull. The pull is a deliberate
-        // fallback for "I want it refreshed *now*"; onResume already rescans
-        // silently on every return.
+        // threshold, release) and fires [onRefresh]. The visuals live in the
+        // content: [PullArrow] while the finger is down (a chevron riding the
+        // pull, flipping when the threshold is crossed), [RefreshLine] while
+        // the scan runs (the sweeping hairline) — two affordances, one gesture.
         PullToRefreshBox(
             isRefreshing = refreshing,
             onRefresh = onRefresh,
+            state = pullState,
             modifier = Modifier
                 // Only the top edge is a hard stop — the bar above owns it.
                 .padding(top = innerPadding.calculateTopPadding())
@@ -251,9 +261,13 @@ fun MainScreen(
                         loadIcon = loadIcon,
                         bottomPadding = innerPadding.calculateBottomPadding() + LIST_BOTTOM_PAD
                     )
-                    // The whole refresh affordance: a hairline scanning the top
-                    // edge while the scan runs, zipping into a full-width stroke
-                    // when it completes.
+                    // While the finger is down: the chevron. Reads
+                    // distanceFraction from the same state the gesture drives,
+                    // appears only during the pull, flips to an up-chevron once
+                    // the pull would commit a refresh.
+                    PullArrow(state = pullState, isRefreshing = refreshing)
+                    // While the scan runs: the hairline scanning the top edge,
+                    // zipping into a full-width stroke when it completes.
                     RefreshLine(
                         visible = refreshing,
                         modifier = Modifier.align(Alignment.TopCenter)
@@ -263,6 +277,121 @@ fun MainScreen(
         )
     }
 }
+
+/**
+ * The pull's visual: a chevron riding the gesture.
+ *
+ * - Finger down: the chevron slides down from under the top bar with the
+ *   pull, pointing down while the pull is below the commit threshold
+ *   ("keep pulling"), rotating to point up once past it ("release to
+ *   refresh"). The rotation is continuous through the transition — not a
+ *   snap — so the flip reads as one gesture-driven motion.
+ * - Released / refreshing: the chevron slides back up under the bar with a
+ *   spring (the same family every other settle on this screen uses) — the
+ *   "拉回去" the user asked for. The spring runs from wherever the chevron
+ *   was released, so the retract is seamless.
+ *
+ * Geometry is a pure function of [PullToRefreshState.distanceFraction] plus
+ * one spring-owned retract value; every animated read happens inside the draw
+ * scope, so nothing re-composes per frame.
+ */
+@Composable
+private fun PullArrow(state: PullToRefreshState, isRefreshing: Boolean) {
+    val chevronColor = MaterialTheme.colorScheme.primary
+    val fraction = state.distanceFraction
+
+    // Two values, strictly ordered: `gesture` (finger down) and `settled`
+    // (spring). The rendered position is gesture while the finger owns the
+    // value, then settled once the spring takes over.
+    var gesture by remember { mutableStateOf(0f) }
+    val settled = remember { Animatable(0f) }
+    val springDown = remember { spring<Float>(stiffness = 380f, dampingRatio = 0.75f) }
+
+    // Finger down: mirror the frame 1:1 (recomposition-scope write — the
+    // finger is the animator), and make sure the spring is parked at 0.
+    val gestureOwns = !isRefreshing && !state.isAnimating && fraction > 0f
+    if (gestureOwns && gesture != fraction) {
+        gesture = fraction
+    }
+    LaunchedEffect(gestureOwns, isRefreshing) {
+        if (gestureOwns) {
+            if (settled.value != 0f) settled.snapTo(0f)
+        } else {
+            // Finger lifted or refresh committed: if the spring is at rest and
+            // the gesture left a value, spring it back under the bar from
+            // there. dampingRatio 0.75 — one soft settle, no bounce: the
+            // arrow yields the stage to the hairline below.
+            val releasePoint = if (gestureOwns) fraction else gesture
+            if (!settled.isRunning && releasePoint > 0.01f) {
+                settled.snapTo(releasePoint)
+                settled.animateTo(0f, springDown)
+                gesture = 0f
+            }
+        }
+    }
+
+    val pull = (if (gestureOwns) gesture else settled.value).coerceIn(0f, 1f)
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(ARROW_SLOT)
+            .clip(RectangleShape),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        if (pull > 0.01f) {
+            Canvas(
+                modifier = Modifier
+                    .padding(top = ARROW_REST + ARROW_TRAVEL * pull)
+                    .size(ARROW_DIAMETER)
+            ) {
+                // Down-chevron below the threshold, rotating through the
+                // transition to up-chevron past it: 180° of rotation mapped to
+                // the last 20% of the pull (0.8→1.0), so the flip is
+                // gesture-driven and continuous.
+                val flip = ((pull - 0.8f) / 0.2f).coerceIn(0f, 1f)
+                val angle = 180f * flip
+                val alpha = pull.coerceIn(0f, 1f)
+                rotate(angle) {
+                    // Chevron: two strokes meeting at the centre, drawn as a
+                    // down-pointing V in local space; the rotate above flips it.
+                    val r = size.minDimension / 2f
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val w = ARROW_STROKE.toPx()
+                    drawLine(
+                        color = chevronColor,
+                        start = Offset(cx - r * 0.5f, cy - r * 0.15f),
+                        end = Offset(cx, cy + r * 0.35f),
+                        strokeWidth = w,
+                        cap = StrokeCap.Round,
+                        alpha = alpha
+                    )
+                    drawLine(
+                        color = chevronColor,
+                        start = Offset(cx, cy + r * 0.35f),
+                        end = Offset(cx + r * 0.5f, cy - r * 0.15f),
+                        strokeWidth = w,
+                        cap = StrokeCap.Round,
+                        alpha = alpha
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Slot height the pull chevron lives in; also its clip window. */
+private val ARROW_SLOT = 64.dp
+
+/** The chevron's rest position below the top edge (fraction 0). */
+private val ARROW_REST = 16.dp
+
+/** How far the chevron travels from rest to the commit threshold. */
+private val ARROW_TRAVEL = 28.dp
+
+private val ARROW_DIAMETER = 32.dp
+
+private val ARROW_STROKE = 2.5.dp
 
 /**
  * The refresh affordance: a 2dp hairline at the very top of the list, sweeping
