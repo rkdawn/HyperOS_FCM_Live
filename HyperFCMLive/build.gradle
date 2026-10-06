@@ -48,11 +48,13 @@ android {
         targetSdkVersion 37
         // Fixed (bumped by hand each release) so LSPosed update checks never treat
         // this fork as older than upstream builds that inherit a low jgit commitCount.
-        // Local test build: versionCode above the official 42 so an install over
-        // the official APK wins the version arbitration; the .deopt suffix keeps
-        // it distinguishable from an official build in the LSPosed module list.
+        // Local test build: one minor above the official 3.6.2 so the in-app update
+        // check (tag = versionName.versionCode, pure-numeric compare, non-numeric
+        // segments parse as 0) sees 3.6.3.43 > 3.6.2.42 and stays quiet.
+        // Do NOT use a letter suffix here ("3.6.2-deopt.1" parses "deopt" as 0 and
+        // reads as older than the official build forever).
         versionCode 43
-        versionName "3.6.2-deopt.1"
+        versionName "3.6.3"
 
         // HyperOS modules ship arm64 only; drop armv7a / x86 / x86_64 natives.
         ndk {
