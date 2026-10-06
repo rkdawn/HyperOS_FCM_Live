@@ -73,6 +73,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.collectLatest
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -303,42 +305,49 @@ private val LIST_BOTTOM_PAD = 16.dp
 @Composable
 private fun RefreshIndicator(state: PullToRefreshState, isRefreshing: Boolean) {
     val frameFraction = state.distanceFraction
-    val gestureActive = !isRefreshing && !state.isAnimating && frameFraction > 0.01f
     val strokeColor = MaterialTheme.colorScheme.onSurfaceVariant
 
-    var rendered by remember { mutableStateOf(0f) }
-    if (gestureActive) {
-        // Finger down: mirror the frame 1:1. A plain write, not an animation —
-        // the finger is the animator.
-        rendered = frameFraction
-    }
-    val springSpec: AnimationSpec<Float> = remember {
-        spring(
+    // One Animatable owns the rendered fraction, and a snapshotFlow drives it
+    // from the frame's own state — the value read below (`rendered.value`) is
+    // itself state, so every frame the spring produces re-runs the draw phase
+    // directly. That stream is what was missing before: writing
+    // `rendered = anim.value` *after* animateTo completed sent exactly one
+    // frame (the final one), so the release read as an instant jump instead
+    // of the bounce the spring had actually computed.
+    val rendered = remember { Animatable(0f) }
+    val releaseSpec = remember {
+        spring<Float>(
             dampingRatio = Spring.DampingRatioMediumBouncy,
             stiffness = Spring.StiffnessMediumLow
         )
     }
-    LaunchedEffect(gestureActive, isRefreshing) {
-        when {
-            gestureActive -> Unit // mirroring above owns the value
-            isRefreshing -> {
-                // Pull up to full and hold there while the refresh runs.
-                val anim = Animatable(rendered.coerceIn(0f, 1f))
-                anim.animateTo(1f, springSpec)
-                rendered = 1f
+    LaunchedEffect(state, isRefreshing) {
+        snapshotFlow {
+            Triple(state.distanceFraction, state.isAnimating, isRefreshing)
+        }.collectLatest { (fraction, animating, refreshing) ->
+            when {
+                // Finger down: mirror the frame 1:1. The finger is the animator.
+                // This branch must win while a live gesture reports a non-zero
+                // pull — checked before the refreshing branch so the frame the
+                // release fires (refreshing flips while the fraction still
+                // holds) cannot hijack the last tracked value into a jump.
+                !animating && !rendered.isRunning && fraction > 0f -> rendered.snapTo(fraction)
+                // Refresh committed: settle on full and hold, spinning.
+                refreshing -> rendered.animateTo(1f, releaseSpec)
+                // The frame is animating: either the release retract (no
+                // refresh pending) or the tail of the hidden animation after
+                // the refresh completed. Either way our spring owns the
+                // visible motion — bounce to rest from wherever the ring is.
+                // This is the "转完之后再回过去" leg: collectLatest cancels the
+                // hold above, the spring overshoots past 0 and settles, the
+                // ring visibly bounces instead of vanishing.
+                animating -> rendered.animateTo(0f, releaseSpec)
+                // Nothing moving, nothing pending: park at rest.
+                else -> rendered.animateTo(0f, releaseSpec)
             }
-            rendered > 0.01f -> {
-                // Released (or refresh finished): bounce to rest from wherever
-                // the value is now. The spring's overshoot below zero is clamped
-                // out at draw time, so the ring visibly bounces and fades.
-                val anim = Animatable(rendered.coerceIn(0f, 1f))
-                anim.animateTo(0f, springSpec)
-                rendered = anim.value
-            }
-            else -> rendered = 0f
         }
     }
-    val shown = rendered.coerceIn(0f, 1.2f)
+    val shown = rendered.value.coerceIn(0f, 1.2f)
     val spinning = isRefreshing || frameFraction > 1f
     val spin = rememberInfiniteTransition(label = "refresh-spin")
     val spinAngle by spin.animateFloat(
@@ -360,7 +369,10 @@ private fun RefreshIndicator(state: PullToRefreshState, isRefreshing: Boolean) {
         if (shown > 0.01f || isRefreshing) {
             Canvas(
                 modifier = Modifier
-                    .padding(top = SPINNER_DROP)
+                    // The bounce travels: the spring's value drives a small
+                    // vertical offset too, so the ring itself dips past rest
+                    // and comes back — the visible Q of the 弹.
+                    .padding(top = (SPINNER_DROP + SPINNER_TRAVEL * shown).coerceAtLeast(0.dp))
                     .size(SPINNER_DIAMETER)
             ) {
                 val pull = shown.coerceIn(0f, 1f)
@@ -391,8 +403,11 @@ private fun RefreshIndicator(state: PullToRefreshState, isRefreshing: Boolean) {
 /** Slot height the spinner lives in; also the clip window for the pull. */
 private val SPINNER_SLOT = 56.dp
 
-/** How far below the top edge the spinner's centre sits, resting state. */
+/** The spinner's rest position below the top edge. */
 private val SPINNER_DROP = 12.dp
+
+/** Vertical travel the bounce rides on: how far the pull slides the ring down. */
+private val SPINNER_TRAVEL = 10.dp
 
 private val SPINNER_DIAMETER = 32.dp
 
