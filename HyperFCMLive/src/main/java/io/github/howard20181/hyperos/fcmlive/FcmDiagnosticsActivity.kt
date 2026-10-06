@@ -501,7 +501,7 @@ private fun readActivityLog(): List<ActivityEvent> {
         // Format: "10-06 23:12:45.123 I/HyperGreeze: <message>" (some builds
         // prepend pid/uid columns; the regex tolerates both).
         val m = LOG_LINE.matchEntire(line.trim()) ?: continue
-        val (stamp, level, msg) = m.destructured
+        val (stamp, msg) = m.destructured
         val event = when {
             msg.startsWith("isAllowBroadcast: c2dm allowed for callee=") -> ActivityEvent(
                 key = "alb-${events.size}-$stamp",
@@ -585,7 +585,7 @@ private fun readActivityLog(): List<ActivityEvent> {
 }
 
 private val LOG_LINE = Regex(
-    """^(?\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\s+[VDIWEF]/\w+\s*\(?\s*\d*\)?\s*:?\s*(.*)$"""
+    """^(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\s+[VDIWEF]/\w+\s*\(?\s*\d*\)?\s*:?\s*(.*)$"""
 )
 
 /** One live TCP socket owned by GMS (or GSF — same uid family). */

@@ -85,6 +85,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.painter.Painter
@@ -199,6 +200,15 @@ fun MainScreen(
     // as long as the scan runs (the line needs the room); when both the
     // finger and the scan are done, the same spring returns it to 0 — the
     // "检测完再弹回去" the user asked for.
+    //
+    // The value is consumed by a graphicsLayer below (draw-phase translation),
+    // NOT by a Spacer's height: a height change re-measures and re-lays-out
+    // the whole list every frame — the jank the previous revision had. A
+    // translation only re-runs the draw pass, which is how the stock
+    // PullToRefreshBox moves its content (its own Animatable runs at
+    // default spring: dampingRatio 1, stiffness 1500 — the reference feel).
+    // The spring specs below were aligned to that: critically damped, no
+    // overshoot, settle fast.
     val frameFraction = pullState.distanceFraction
     val gestureOwns = !refreshing && !pullState.isAnimating && frameFraction > 0f
     var gesture by remember { mutableStateOf(0f) }
@@ -214,11 +224,13 @@ fun MainScreen(
             }
             refreshing -> {
                 // Scan committed: open to full and hold, from wherever the
-                // finger left it. If the finger is already past the threshold
-                // the transition is invisible; a short pull gets carried up.
+                // finger left it. Default Animatable spec (critical damping,
+                // stiffness 1500) — same curve the framework uses for its
+                // own indicator, and the one that does not read as dropped
+                // frames.
                 val start = maxOf(gesture, gapSpring.value, if (gestureOwns) frameFraction else 0f)
                 gapSpring.snapTo(start.coerceIn(0f, 1f))
-                gapSpring.animateTo(1f, spring(stiffness = 300f, dampingRatio = 0.85f))
+                gapSpring.animateTo(1f)
             }
             else -> {
                 // Finger lifted, no scan: close. Also the scan-just-ended leg —
@@ -226,7 +238,7 @@ fun MainScreen(
                 val releasePoint = maxOf(gesture, gapSpring.value)
                 if (releasePoint > 0.01f && !gapSpring.isRunning) {
                     gapSpring.snapTo(releasePoint.coerceIn(0f, 1f))
-                    gapSpring.animateTo(0f, spring(stiffness = 260f, dampingRatio = 0.8f))
+                    gapSpring.animateTo(0f)
                 }
                 gesture = 0f
             }
@@ -297,18 +309,32 @@ fun MainScreen(
                 .fillMaxSize(),
             indicator = {},
             content = {
-                Column(modifier = Modifier.fillMaxSize()) {
-                    // The gap: layout-reserved, never overlapping the list.
-                    Spacer(
+                // The gap is a FIXED-height block whose visibility is driven by
+                // graphicsLayer translation — a draw-phase-only property. The
+                // previous revision drove a Spacer's height from the animated
+                // fraction, which re-measured the whole list every frame; that
+                // is what the "掉帧" was. Here the closed gap slides up behind
+                // the top bar (negative translation), the open one sits at 0.
+                // The LazyColumn below never re-measures during the animation.
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            val gapPx = (GAP_REST + GAP_TRAVEL * gapFraction).toPx()
+                            translationY = gapPx - (GAP_REST + GAP_TRAVEL).toPx()
+                        }
+                ) {
+                    // Fixed-height gap block: the sweeping line lives here.
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(GAP_REST + GAP_TRAVEL * gapFraction)
-                    )
-                    // The refresh line, riding inside the gap.
-                    RefreshLine(
-                        visible = refreshing,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                            .height(GAP_REST + GAP_TRAVEL)
+                    ) {
+                        RefreshLine(
+                            visible = refreshing,
+                            modifier = Modifier.align(Alignment.TopCenter)
+                        )
+                    }
                     AppListPane(
                         apps = apps,
                         multiSelect = multiSelect,

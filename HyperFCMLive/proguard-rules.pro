@@ -64,3 +64,7 @@
 
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod,MethodParameters
 -keepattributes SourceFile,LineNumberTable
+
+# libsu (diagnostics page root shell). Its bundled rules cover the basics;
+# these keep the builder/service classes the reflection paths resolve.
+-keep class com.topjohnwu.superuser.** { *; }
