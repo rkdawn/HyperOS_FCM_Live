@@ -350,11 +350,15 @@ private fun RefreshLine(visible: Boolean, modifier: Modifier = Modifier) {
     }
 }
 
-/** Thickness of the top refresh hairline. */
-private val REFRESH_LINE_THICKNESS = 2.dp
+/** Thickness of the top refresh hairline. 3dp: 2dp read as too faint to spot. */
+private val REFRESH_LINE_THICKNESS = 3.dp
 
-/** Sweeping segment length as a fraction of the line's width. */
-private const val REFRESH_LINE_SEGMENT = 0.22f
+/**
+ * Sweeping segment length as a fraction of the line's width. 0.22 was easy to
+ * lose against a full-width list; 0.40 covers enough of the screen that the
+ * motion catches the eye at a glance.
+ */
+private const val REFRESH_LINE_SEGMENT = 0.40f
 
 /** Bottom padding the last list card keeps above the navigation-bar inset. */
 private val LIST_BOTTOM_PAD = 16.dp
