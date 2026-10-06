@@ -68,11 +68,21 @@ object UpdateChecker {
         if (!force) {
             val last = prefs(app).getLong(KEY_LAST_AUTO_CHECK, 0L)
             if (System.currentTimeMillis() - last < AUTO_CHECK_INTERVAL_MS) {
-                callback?.onResult(
-                    isUpdateAvailable(app),
-                    cachedVersion(app),
-                    cachedUrl(app)
-                )
+                // The cached verdict predates whatever APK is now installed:
+                // an install over the old build keeps this app's data, so a
+                // badge saved by the previous build would re-show here even
+                // though the "new version" it names is already on the device.
+                // Re-check the cached version against the local tag and clear
+                // the badge when the local build has caught up (or passed) it.
+                val cached = cachedVersion(app)
+                if (isUpdateAvailable(app) && cached.isNotEmpty() &&
+                    compareVersions(cached, localVersionTag(app)) <= 0
+                ) {
+                    clearBadge(app)
+                    callback?.onResult(false, "", cachedUrl(app))
+                    return
+                }
+                callback?.onResult(isUpdateAvailable(app), cached, cachedUrl(app))
                 return
             }
         }
