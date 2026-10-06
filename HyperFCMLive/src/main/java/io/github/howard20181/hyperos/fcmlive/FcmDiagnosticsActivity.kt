@@ -149,9 +149,9 @@ fun FcmDiagnosticsScreen(
         val dc: Int
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
             r = buildRows(context)
-            ev = readActivityLog()
+            ev = readActivityLog(context)
             sk = readMcsSockets(context)
-            pa = aggregateAppStats()
+            pa = aggregateAppStats(context)
             dc = countDisconnects(context)
         }
         rows.value = r
@@ -568,7 +568,7 @@ private data class ActivityEvent(
  * activity feed — no new hook, no new storage, just parsing what is already
  * on the device.
  */
-private fun readActivityLog(): List<ActivityEvent> {
+private fun readActivityLog(context: Context): List<ActivityEvent> {
     val out = try {
         com.topjohnwu.superuser.Shell
             .cmd("logcat -d -s HyperGreeze -t 800").exec().out
@@ -581,21 +581,22 @@ private fun readActivityLog(): List<ActivityEvent> {
         // prepend pid/uid columns; the regex tolerates both).
         val m = LOG_LINE.matchEntire(line.trim()) ?: continue
         val (stamp, msg) = m.destructured
+        val time = stamp.substring(0, 12)
         val event = when {
-            msg.startsWith("isAllowBroadcast: c2dm allowed for callee=") -> ActivityEvent(
-                key = "alb-${events.size}-$stamp",
-                time = stamp.substring(0, 12),
-                verb = "已送达",
-                subject = msg.substringAfter("callee=").substringBefore(' ')
-                    .ifEmpty { "未知应用" },
+            // Every delivered push (per-delivery line, not one-shot).
+            msg.startsWith("delivery: pkg=") -> ActivityEvent(
+                key = "dlv-${events.size}-$stamp",
+                time = time,
+                verb = "收到推送",
+                subject = appLabel(context, msg.substringAfter("pkg=").substringBefore(' ')),
                 good = true
             )
             msg.startsWith("isAllowBroadcast: c2dm not intercepted for") -> ActivityEvent(
                 key = "skip-${events.size}-$stamp",
-                time = stamp.substring(0, 12),
+                time = time,
                 verb = "未接管",
-                subject = msg.substringAfter("callee=").substringBefore(' ')
-                    .ifEmpty { "未知应用" } + "（严格模式未勾选）",
+                subject = appLabel(context, msg.substringAfter("callee=").substringBefore(' ')
+                    .ifEmpty { "未知应用" }) + "（严格模式未勾选）",
                 good = false
             )
             msg.startsWith("gms probe [") -> {
@@ -604,53 +605,122 @@ private fun readActivityLog(): List<ActivityEvent> {
                 if (rx != null && tx != null) {
                     ActivityEvent(
                         key = "probe-${events.size}-$stamp",
-                        time = stamp.substring(0, 12),
+                        time = time,
                         verb = "GMS 流量",
-                        subject = "收 ${(rx / 1024.0).let { if (it >= 1024) "%.1f MB".format(it / 1024) else "%.1f KB".format(it) }}，发 ${(tx / 1024.0).let { if (it >= 1024) "%.1f MB".format(it / 1024) else "%.1f KB".format(it) }}",
+                        subject = "近半小时收 ${fmtBytes(rx)}、发 ${fmtBytes(tx)}",
                         good = rx > 0 || tx > 0
                     )
                 } else null
             }
             msg.startsWith("checkAlarmIsAllowedSend: re-allowed denied GMS alarm") -> ActivityEvent(
                 key = "alarm-${events.size}-$stamp",
-                time = stamp.substring(0, 12),
+                time = time,
                 verb = "已放行",
-                subject = "GMS 心跳闹钟（系统原本拒绝）",
+                subject = "GMS 心跳闹钟（系统原本拒绝送达）",
                 good = true
             )
             msg.startsWith("udpPackageRestrict: skipped UDP filter for GMS") -> ActivityEvent(
                 key = "udp-${events.size}-$stamp",
-                time = stamp.substring(0, 12),
+                time = time,
                 verb = "已拦截",
-                subject = "系统对 GMS 的 UDP 过滤",
+                subject = "系统试图过滤 GMS 的网络包",
                 good = true
             )
             msg.startsWith("AppStandbyController#setUidState: kept GMS") -> ActivityEvent(
                 key = "sb-${events.size}-$stamp",
-                time = stamp.substring(0, 12),
+                time = time,
                 verb = "已保活",
-                subject = "GMS 待机限制（系统试图收紧）",
+                subject = "系统试图限制 GMS 待机网络",
                 good = true
             )
+            msg.contains("GMS missing from doze whitelist") -> {
+                val n = Regex("injected #(\\d+)").find(msg)?.groupValues?.get(1)
+                ActivityEvent(
+                    key = "doze-${events.size}-$stamp",
+                    time = time,
+                    verb = "已加回",
+                    subject = "系统把 GMS 踢出免打扰白名单" + (n?.let { "（第 $it 次）" } ?: ""),
+                    good = true
+                )
+            }
+            msg.startsWith("P3: rewrote GMS scenario") -> ActivityEvent(
+                key = "p3-${events.size}-$stamp",
+                time = time,
+                verb = "已改写",
+                subject = "GMS 省电场景 → 无限制",
+                good = true
+            )
+            msg.startsWith("MILLET_NO_RESTRICT_APP: appended GMS") -> ActivityEvent(
+                key = "mil-${events.size}-$stamp",
+                time = time,
+                verb = "已写入",
+                subject = "GMS 加入系统不限制名单",
+                good = true
+            )
+            msg.startsWith("userTable: update") && msg.contains("noRestrict") -> ActivityEvent(
+                key = "ut-${events.size}-$stamp",
+                time = time,
+                verb = "已修正",
+                subject = "GMS 电源配置 → 不限制",
+                good = true
+            )
+            msg.startsWith("standby-firewall: suppressed") -> {
+                val n = Regex("#(\\d+)").find(msg)?.groupValues?.get(1)
+                ActivityEvent(
+                    key = "sbw-${events.size}-$stamp",
+                    time = time,
+                    verb = "已拦截",
+                    subject = "系统待机防火墙命令" + (n?.let { "（第 $it 次）" } ?: ""),
+                    good = true
+                )
+            }
+            msg.startsWith("socket-teardown probe") && msg.contains("gmsHit=true") -> {
+                val layer = msg.substringAfter("probe[").substringBefore(']')
+                ActivityEvent(
+                    key = "td-${events.size}-$stamp",
+                    time = time,
+                    verb = "已记录",
+                    subject = "系统试图断开 GMS 的网络连接（$layer 层）",
+                    good = false
+                )
+            }
+            msg.startsWith("wake-path probe: broadcast DENIED") ||
+                msg.startsWith("wake-path probe: checkWakePath DENIED") -> {
+                val caller = Regex("callerPkg=([^)]+)").find(msg)?.groupValues?.get(1) ?: "未知来源"
+                ActivityEvent(
+                    key = "wp-${events.size}-$stamp",
+                    time = time,
+                    verb = "唤醒被拒",
+                    subject = "系统拒绝了 $caller 的唤醒请求（探针只观测，未干预）",
+                    good = false
+                )
+            }
             msg.startsWith("sleep-mode: kept WiFi on") -> ActivityEvent(
                 key = "sw-${events.size}-$stamp",
-                time = stamp.substring(0, 12),
+                time = time,
                 verb = "睡眠保活",
                 subject = "WiFi（睡眠模式原本会关闭）",
                 good = true
             )
             msg.startsWith("sleep-mode: kept mobile data on") -> ActivityEvent(
                 key = "sd-${events.size}-$stamp",
-                time = stamp.substring(0, 12),
+                time = time,
                 verb = "睡眠保活",
                 subject = "移动数据（睡眠模式原本会关闭）",
                 good = true
             )
             msg.startsWith("P4: recovery broadcasts sent") -> ActivityEvent(
                 key = "rec-${events.size}-$stamp",
-                time = stamp.substring(0, 12),
+                time = time,
                 verb = "重连",
-                subject = "已请求 GMS/GSF 重连推送",
+                subject = "已请求 GMS/GSF 重新连接推送服务器",
+                good = true
+            )
+            msg.startsWith("Hot reload requested") -> ActivityEvent(
+                key = "hr-${events.size}-$stamp",
+                time = time,
+                verb = "模块",
+                subject = "已热重载（无需重启即生效）",
                 good = true
             )
             else -> null
@@ -660,7 +730,21 @@ private fun readActivityLog(): List<ActivityEvent> {
         }
     }
     // Newest first; the buffer is chronological. Cap for scroll health.
-    return events.takeLast(30).reversed()
+    return events.takeLast(40).reversed()
+}
+
+/** Resolves a package name to the app's label; falls back to the raw name. */
+private fun appLabel(context: Context, pkg: String): String = try {
+    context.packageManager.getApplicationLabel(
+        context.packageManager.getApplicationInfo(pkg, 0)
+    ).toString()
+} catch (t: Throwable) {
+    pkg
+}
+
+private fun fmtBytes(b: Long): String {
+    val kb = b / 1024.0
+    return if (kb >= 1024) "%.1f MB".format(kb / 1024) else "%.1f KB".format(kb)
 }
 
 private val LOG_LINE = Regex(
@@ -894,7 +978,13 @@ private data class AppStat(
  * one-shot firsts), so counting log lines IS counting deliveries within the
  * buffer's retention (~a few hours on a busy device).
  */
-private fun aggregateAppStats(): List<AppStat> {
+/**
+ * Aggregates the per-app delivery counts from the "delivery:" log lines the
+ * hooker writes once per delivered push (not one-shot — see Hooker.kt). The
+ * buffer's retention bounds the window (~a few hours on a busy device); the
+ * label resolves through the package manager so rows read as app names.
+ */
+private fun aggregateAppStats(context: Context): List<AppStat> {
     val out = try {
         com.topjohnwu.superuser.Shell
             .cmd("logcat -d -s HyperGreeze -t 2000").exec().out
@@ -906,8 +996,8 @@ private fun aggregateAppStats(): List<AppStat> {
     for (line in out) {
         val m = LOG_LINE.matchEntire(line.trim()) ?: continue
         val msg = m.groupValues[2]
-        if (!msg.startsWith("isAllowBroadcast: c2dm allowed for callee=")) continue
-        val pkg = msg.substringAfter("callee=").substringBefore(' ').ifEmpty { continue }
+        if (!msg.startsWith("delivery: pkg=")) continue
+        val pkg = msg.substringAfter("pkg=").substringBefore(' ').ifEmpty { continue }
         val stamp = m.groupValues[1]
         val prev = counts[pkg]
         counts[pkg] = if (prev == null) Acc(1, stamp) else Acc(prev.count + 1, prev.lastStamp)
@@ -918,7 +1008,7 @@ private fun aggregateAppStats(): List<AppStat> {
         .map { (pkg, acc) ->
             AppStat(
                 pkg = pkg,
-                label = pkg.substringAfterLast('.'),
+                label = appLabel(context, pkg),
                 deliveries = acc.count,
                 lastSeen = acc.lastStamp.substring(0, 12)
             )

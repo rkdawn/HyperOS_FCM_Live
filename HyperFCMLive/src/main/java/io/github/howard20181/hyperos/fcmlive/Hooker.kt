@@ -775,6 +775,16 @@ class Hooker : XposedModule() {
                             if (!callerPkgIsGms) {
                                 broadcastGateAllowedByUidCount++
                             }
+                            // Per-delivery line (NOT one-shot): the diagnostics
+                            // page aggregates these into per-app push counts.
+                            // One INFO line per delivered push is affordable —
+                            // c2dm arrivals are tens per app per day, not per
+                            // second — and the "delivery:" prefix is the stable
+                            // contract the parser greps for.
+                            log(
+                                Log.INFO, TAG,
+                                "delivery: pkg=$calleePkgName caller=${callerPkg ?: callerUid ?: "?"}"
+                            )
                             if (!broadcastGateAllowedLogged) {
                                 broadcastGateAllowedLogged = true
                                 log(
