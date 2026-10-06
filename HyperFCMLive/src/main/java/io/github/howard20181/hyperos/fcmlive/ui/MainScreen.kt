@@ -215,14 +215,24 @@ fun MainScreen(
     // but it flips once per scan, not per frame.
     val gestureFraction = remember { mutableStateOf(0f) }
     val gapSpring = remember { Animatable(0f) }
-    val gestureOwns by remember {
-        derivedStateOf {
-            !refreshing && !pullState.isAnimating && pullState.distanceFraction > 0f
-        }
-    }
     // Finger tracking stays a composition write (the finger is the animator);
     // derivedStateOf keeps the recomposition it triggers scoped to the
     // observers that actually read `gestureOwns`, not the whole screen.
+    //
+    // NOTE: `gestureOwns` deliberately does NOT consult pullState.isAnimating.
+    // The frame drives its fraction with a per-frame snapTo, which restarts
+    // the internal Animatable every frame — isAnimating flickers frame to
+    // frame. A display source chosen on that flag would flip between the
+    // gesture value and the spring's parked 0, and the gap would visibly
+    // blink shut and back every few frames — the "掉一下帧又弹回去" the user
+    // saw. The flag only decides WHO WRITES next (the sequencer below), and
+    // the write path is idempotent per source, so the flicker there is
+    // harmless.
+    val gestureOwns by remember {
+        derivedStateOf {
+            !refreshing && pullState.distanceFraction > 0f
+        }
+    }
     if (gestureOwns && gestureFraction.value != pullState.distanceFraction) {
         gestureFraction.value = pullState.distanceFraction
     }
@@ -258,6 +268,9 @@ fun MainScreen(
             else -> {
                 // Finger lifted, no scan: close. Also the scan-just-ended leg —
                 // both arrive here, and both close the gap the same way.
+                // The spring picks up from the larger of the two sources, then
+                // the gesture value retires — AFTER the spring has taken the
+                // hand-off, so no frame renders a closed gap in between.
                 val releasePoint = maxOf(gestureFraction.value, gapSpring.value)
                 if (releasePoint > 0.01f && !gapSpring.isRunning) {
                     gapSpring.snapTo(releasePoint.coerceIn(0f, 1f))
@@ -352,11 +365,16 @@ fun MainScreen(
                             // States it reads change, without invalidating
                             // composition — the whole point of the frame-economy
                             // contract above.
-                            val f = if (gestureOwns) {
-                                gestureFraction.value
-                            } else {
-                                gapSpring.value
-                            }
+                            //
+                            // Source selection is "whichever is non-zero", not a
+                            // mode flag: the frame's snapTo makes isAnimating
+                            // flicker frame to frame, and a flag-chosen source
+                            // would blink the gap shut on every flickering frame
+                            // (the spring sits at 0 while the gesture value
+                            // still holds the pull). max() of both is continuous
+                            // through every hand-off — gesture → spring open,
+                            // spring → gesture close, all monotonic.
+                            val f = maxOf(gestureFraction.value, gapSpring.value)
                             val gapPx = (GAP_REST + GAP_TRAVEL * f).toPx()
                             translationY = gapPx - (GAP_REST + GAP_TRAVEL).toPx()
                         }
