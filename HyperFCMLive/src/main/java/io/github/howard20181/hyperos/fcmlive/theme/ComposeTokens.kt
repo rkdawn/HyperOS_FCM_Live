@@ -5,8 +5,6 @@
  *   surface scale. Add or change a scale here, never at a call site.
  * - Compose: `.clip(shape)` must come **before** `.clickable`, or the ripple
  *   spills outside the shape.
- * - A FAB needs an explicit FAB_CLEARANCE (88.dp) above the list; the
- *   scaffold does not reserve it.
  * - material3 is pinned to 1.5.0-alpha27, which does not accept
  *   `menuAnchorPosition`: right-aligned dropdowns are done with
  *   `matchParentSize().wrapContentSize(BottomEnd)` instead.

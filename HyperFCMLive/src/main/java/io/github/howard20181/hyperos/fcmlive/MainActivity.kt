@@ -270,7 +270,8 @@ class MainActivity : AppCompatActivity() {
                         onToggleShowSystemApps = { toggleOverflowShowSystemApps() },
                         onToggleShowFcmOnly = { toggleOverflowShowFcmOnly() },
                         onToggleExcludeMiPush = { toggleOverflowExcludeMiPush() },
-                        onToggleStrictMode = { toggleOverflowStrictMode() }
+                        onToggleStrictMode = { toggleOverflowStrictMode() },
+                        onDiagnostics = { openFcmDiagnostics() }
                     ),
                     // The field reads the query from this state, so no view
                     // hand-off is needed: whatever currentQuery holds when the
@@ -286,7 +287,6 @@ class MainActivity : AppCompatActivity() {
                     loadIcon = { store?.loadIcon(it) },
                     refreshing = refreshing,
                     onRefresh = { refreshing = true; loadApps() },
-                    onDiagnostics = { openFcmDiagnostics() },
                     snackbarHostState = snackbarHostState
                 )
             }

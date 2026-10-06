@@ -3,6 +3,13 @@ package io.github.howard20181.hyperos.fcmlive.ui
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import android.view.HapticFeedbackConstants
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
@@ -53,7 +60,7 @@ import androidx.compose.material3.TooltipAnchorPosition
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
-import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.PullToRefreshState
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
@@ -69,8 +76,12 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.painter.Painter
@@ -137,21 +148,19 @@ data class MainActions(
     val onToggleShowSystemApps: () -> Unit,
     val onToggleShowFcmOnly: () -> Unit,
     val onToggleExcludeMiPush: () -> Unit,
-    val onToggleStrictMode: () -> Unit
+    val onToggleStrictMode: () -> Unit,
+    val onDiagnostics: () -> Unit
 )
 
 /**
- * The whole page: bar, list, pull-to-refresh and the diagnostics button.
+ * The whole page: bar, list and pull-to-refresh.
  *
- * Hosting it as one composition is what lets the refresh be the M3 Expressive
- * [LoadingIndicator] instead of a stand-in drawn over a hidden View spinner.
- * A `SwipeRefreshLayout` owns its spinner as a private child and cannot be
- * told to draw another one, so the old shell kept the stock spinner around for
- * its geometry and mirrored position, scale and visibility onto a second view
- * every frame. `PullToRefreshBox` is a Compose gesture that reports its own
- * progress, so none of that survives here — and neither does the View that had
- * to ask a `LazyListState` whether the list was already scrolled, because the
- * nested-scroll handshake answers that by itself.
+ * Hosting it as one composition is what lets the refresh be the bare spinner
+ * [RefreshIndicator] draws instead of the stock M3 Expressive plate-and-morph
+ * indicator. `PullToRefreshBox` is a Compose gesture that reports its own
+ * progress, so none of the old View-shell machinery survives here — and
+ * neither does the View that had to ask a `LazyListState` whether the list was
+ * already scrolled, because the nested-scroll handshake answers that by itself.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -168,7 +177,6 @@ fun MainScreen(
     loadIcon: (AppListStore.AppEntry) -> Unit,
     refreshing: Boolean,
     onRefresh: () -> Unit,
-    onDiagnostics: () -> Unit,
     modifier: Modifier = Modifier,
     // Remembered here, inside the composition, so the position is part of the
     // saveable state the host window restores. The Activity used to build the
@@ -221,14 +229,6 @@ fun MainScreen(
                 query = query,
                 onQueryChange = onQueryChange
             )
-        },
-        // No margin of our own. Scaffold already places the FAB one
-        // `FabSpacing` (16dp) off the end edge and `FabSpacing + navBar inset`
-        // off the bottom — it reserves the same room in `innerPadding`, so the
-        // old hand-rolled 20dp/26dp/inset stack pushed the button ~36dp off the
-        // right edge and ~62dp off the bottom instead of the XML's 20/34.
-        floatingActionButton = {
-            DiagnosticsFab(onClick = onDiagnostics)
         }
     ) { innerPadding ->
         PullToRefreshBox(
@@ -243,15 +243,7 @@ fun MainScreen(
                 // nothing paints a dead background band at the screen edge.
                 .padding(top = innerPadding.calculateTopPadding())
                 .fillMaxSize(),
-            indicator = {
-                PullToRefreshDefaults.LoadingIndicator(
-                    state = pullState,
-                    isRefreshing = refreshing,
-                    modifier = Modifier.align(Alignment.TopCenter),
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-            },
+            indicator = { RefreshIndicator(pullState, refreshing) },
             content = {
                 AppListPane(
                     apps = apps,
@@ -261,7 +253,7 @@ fun MainScreen(
                     onRowClick = onRowClick,
                     onRowLongClick = onRowLongClick,
                     loadIcon = loadIcon,
-                    bottomPadding = innerPadding.calculateBottomPadding() + FAB_CLEARANCE
+                    bottomPadding = innerPadding.calculateBottomPadding() + LIST_BOTTOM_PAD
                 )
             }
         )
@@ -269,56 +261,106 @@ fun MainScreen(
 }
 
 /**
- * Room the last card keeps between itself and the navigation-bar inset, so the
- * FAB never rests on it after a full scroll. Scaffold's `innerPadding` covers
- * the navigation-bar inset only — the FAB is not part of it — so the clearance
- * is stated here: FAB height (56dp) + the FAB spacing Scaffold applies (16dp)
- * + one gap of the same 16dp. Scroll-through immersion is unaffected: this
- * lives in the list's `contentPadding`, so cards still glide under the FAB and
- * the gesture line while scrolling.
+ * Room the last card keeps between itself and the navigation-bar inset. The FAB
+ * is gone (diagnostics lives in the overflow menu now), so this is one gap only.
  */
-private val FAB_CLEARANCE = 88.dp
+private val LIST_BOTTOM_PAD = 16.dp
 
 /**
- * FCM diagnostics, with the same long-press tooltip the other icons carry.
+ * The pull-to-refresh feedback: a thin stroke-only arc, no container.
  *
- * The bubble used to be a `PopupWindow` measured and clamped against a freeform
- * window by hand; `TooltipBox` does the placement.
+ * The stock [PullToRefreshDefaults.LoadingIndicator] is the M3 Expressive
+ * box-in-box indicator: a filled circular plate that grows with the pull and
+ * keeps morphing while it spins. On this page the plate read as a heavy blob
+ * pinned to the top of the list — the user asked for the classic behaviour
+ * instead: pull, a bare spinner follows the finger, release, the list snaps
+ * back and the arc just spins until the refresh completes. Nothing else.
+ *
+ * So this draws exactly that. The geometry is driven entirely by
+ * [PullToRefreshState.distanceFraction]:
+ *
+ * - 0 .. 1 (the pull): the arc grows from 0° up to 270° and fades in from
+ *   nothing, tracking the finger. Its centre rides down with the same
+ *   fraction, inside a fixed-height slot that clips at the top edge — the
+ *   spinner appears to slide out from under the top bar.
+ * - > 1 or [isRefreshing] (committed): the arc holds 270° and sweeps around
+ *   forever — the one spinning circle the user asked for.
+ *
+ * Everything (position, arc length, alpha) is a function of the fraction and
+ * one time source; there is no state machine and no animation to desync. The
+ * slot is [SPINNER_SLOT] tall so the clip window does not change with the
+ * pull, and the spinner's own diameter [SPINNER_DIAMETER] is small enough to
+ * pass under the status-bar inset without touching the list's first card.
+ *
+ * `pullState.distanceFraction` is a plain float state read inside the draw
+ * scope, so every frame of the pull recomposes nothing — only the draw phase
+ * re-runs. The spin uses `rememberInfiniteTransition` for the same reason: one
+ * float, one draw.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DiagnosticsFab(onClick: () -> Unit) {
-    val label = stringResource(R.string.fcm_diagnostics)
-    TooltipBox(
-        // Above, unlike the top-bar icons: this one sits at the bottom of the
-        // screen, so below would run it into the gesture strip.
-        positionProvider = TooltipDefaults.rememberTooltipPositionProvider(
-            TooltipAnchorPosition.Above
+private fun RefreshIndicator(state: PullToRefreshState, isRefreshing: Boolean) {
+    val fraction = state.distanceFraction
+    val spinning = isRefreshing || fraction > 1f
+    val strokeColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val spin = rememberInfiniteTransition(label = "refresh-spin")
+    val spinAngle by spin.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 800, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
         ),
-        tooltip = {
-            PlainTooltip { Text(label, style = MaterialTheme.typography.bodySmall) }
-        },
-        state = rememberTooltipState()
+        label = "refresh-spin-angle"
+    )
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(SPINNER_SLOT)
+            .clipToTop(),
+        contentAlignment = Alignment.TopCenter
     ) {
-        FloatingActionButton(
-            onClick = onClick,
-            shape = LocalAppShapes.current.fab,
-            containerColor = MaterialTheme.colorScheme.primaryContainer,
-            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-        ) {
-            Icon(
-                painter = painterResource(R.drawable.ic_fcm_diagnostics),
-                contentDescription = label,
-                // 28dp, not the 24dp an icon defaults to: `build` is a thin
-                // glyph that draws well inside its box, so at 24dp the wrench
-                // sat in a pool of empty plate and read small next to the
-                // top-bar icons. Larger glyph, same 56dp container — the plate
-                // is what the target size is measured on, not the ink.
-                modifier = Modifier.size(28.dp)
-            )
+        if (fraction > 0.01f || isRefreshing) {
+            Canvas(
+                modifier = Modifier
+                    .padding(top = SPINNER_DROP)
+                    .size(SPINNER_DIAMETER)
+            ) {
+                // Pull phase: 0..1 drives both how much of the circle is drawn
+                // (a quarter arc up to three quarters) and how visible it is.
+                // Committed phase: full 270° sweep, fully opaque, rotating.
+                val pull = fraction.coerceIn(0f, 1f)
+                val alpha = if (isRefreshing) 1f else pull
+                val sweep = if (spinning) 270f else 45f + 270f * pull
+                val start = if (spinning) spinAngle - 90f else -90f
+                val stroke = Stroke(
+                    width = SPINNER_STROKE.toPx(),
+                    cap = StrokeCap.Round
+                )
+                drawArc(
+                    color = strokeColor,
+                    startAngle = start,
+                    sweepAngle = sweep,
+                    useCenter = false,
+                    style = stroke,
+                    alpha = alpha
+                )
+            }
         }
     }
 }
+
+/** Slot height the spinner lives in; also the clip window for the pull. */
+private val SPINNER_SLOT = 56.dp
+
+/** How far below the top edge the spinner's centre sits, resting state. */
+private val SPINNER_DROP = 12.dp
+
+private val SPINNER_DIAMETER = 32.dp
+
+private val SPINNER_STROKE = 2.5.dp
+
+/** Clips drawing above the slot's top edge, so the pull slides out from under the bar. */
+private fun Modifier.clipToTop(): Modifier = clip(RectangleShape)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -632,6 +674,16 @@ private fun OverflowMenu(state: OverflowState, actions: MainActions) {
             )
             Spacer(modifier = Modifier.height(MENU_ITEM_GAP))
             MenuItemRow(
+                label = stringResource(R.string.fcm_diagnostics),
+                modifier = Modifier.fillMaxWidth(),
+                minWidth = MENU_OVERFLOW_MIN_WIDTH,
+                leading = {
+                    RowIcon(painter = painterResource(R.drawable.ic_fcm_diagnostics))
+                },
+                onClick = { expanded = false; actions.onDiagnostics() }
+            )
+            Spacer(modifier = Modifier.height(MENU_ITEM_GAP))
+            MenuItemRow(
                 label = stringResource(R.string.settings),
                 modifier = Modifier.fillMaxWidth(),
                 minWidth = MENU_OVERFLOW_MIN_WIDTH,
@@ -937,7 +989,8 @@ private fun MainScreenPreview() {
                 onToggleShowSystemApps = {},
                 onToggleShowFcmOnly = {},
                 onToggleExcludeMiPush = {},
-                onToggleStrictMode = {}
+                onToggleStrictMode = {},
+                onDiagnostics = {}
             ),
             query = "",
             onQueryChange = {},
@@ -961,8 +1014,7 @@ private fun MainScreenPreview() {
             onRowLongClick = {},
             loadIcon = {},
             refreshing = false,
-            onRefresh = {},
-            onDiagnostics = {}
+            onRefresh = {}
         )
     }
 }
