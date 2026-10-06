@@ -227,6 +227,12 @@ class Hooker : XposedModule() {
         // buffering without this flush would drop every merged finding silently
         // on every hot reload, which is the one failure mode the merged lines
         // exist to make visible. `finally` so a throw cannot lose them either.
+        // The counters belong to the pass too: a hot reload re-runs the whole
+        // install surface, so carrying the previous pass's counts would make
+        // the next summary line read like twice as many hooks.
+        hooksInstalled = 0
+        hookTargetsAbsent = 0
+        hookTargetsAbsentOtherGeneration = 0
         installPassCollecting = true
         try {
             for (group in systemServerGroups(classLoader)) {
@@ -597,6 +603,9 @@ class Hooker : XposedModule() {
         // Same reasoning as [hookSystemServer]: this is also the hot-reload entry
         // point. Only the PowerKeeper domain installs anything, so for any other
         // package both buffers are empty and the flush is a no-op.
+        hooksInstalled = 0
+        hookTargetsAbsent = 0
+        hookTargetsAbsentOtherGeneration = 0
         installPassCollecting = true
         try {
             if ("com.miui.powerkeeper" == packageName) {
@@ -1133,6 +1142,7 @@ class Hooker : XposedModule() {
                     }
                     chain.proceed()
                 }
+                deoptimize(isInWhiteListMethod)
             }
         } catch (e: NoSuchMethodException) {
             log(Log.ERROR, TAG, "Failed to hook ListAppsManager#isInWhiteList", e)
@@ -1328,12 +1338,13 @@ class Hooker : XposedModule() {
             try {
                 val flags = chain.getArg(0)
                 if (flags is Int && (flags and 1) != 0 && result is List<*>) {
-                    val source = result
-                    val whiteList = ArrayList<Any?>(source)
+                    // One copy, returned — the in-place append to the ROM's own
+                    // list that used to sit beside this was redundant (the caller
+                    // sees only the returned value) and mutated a list this
+                    // process does not own.
+                    val whiteList = ArrayList<Any?>(result)
                     addIfAbsent(whiteList, GMS_PACKAGE_NAME)
                     addIfAbsent(whiteList, GMS_PERSISTENT_PROCESS_NAME)
-                    addIfAbsentInPlace(source, GMS_PACKAGE_NAME)
-                    addIfAbsentInPlace(source, GMS_PERSISTENT_PROCESS_NAME)
                     return@intercept whiteList
                 }
             } catch (t: Throwable) {
@@ -1341,6 +1352,7 @@ class Hooker : XposedModule() {
             }
             result
         }
+        deoptimize(getWhiteListMethod)
     }
 
     private fun addIfAbsent(list: MutableList<Any?>, value: String) {
@@ -2854,6 +2866,7 @@ class Hooker : XposedModule() {
                         }
                         result
                     }
+                    deoptimize(getDozeWhiteListAppsMethod)
                 } catch (e: NoSuchMethodException) {
                     logSkip(
                         "GlobalFeatureConfigureHelper#getDozeWhiteListApps(" +
@@ -5011,6 +5024,7 @@ class Hooker : XposedModule() {
             }
             chain.proceed()
         }
+        deoptimize(isPushAppMethod)
     }
 
     /**
@@ -5075,6 +5089,7 @@ class Hooker : XposedModule() {
             }
             chain.proceed()
         }
+        deoptimize(isForceStopEnableMethod)
     }
 
     private val fcmCache = HashMap<String, FcmQuery>()
