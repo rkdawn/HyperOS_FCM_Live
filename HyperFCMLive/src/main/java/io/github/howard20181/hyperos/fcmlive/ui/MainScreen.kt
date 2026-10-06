@@ -63,6 +63,7 @@ import androidx.compose.material3.TooltipAnchorPosition
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.rememberTooltipState
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -226,28 +227,43 @@ fun MainScreen(
             )
         }
     ) { innerPadding ->
-        Box(
+        // The gesture is back, the ring is not: PullToRefreshBox carries the
+        // nested-scroll handshake (list must be at the very top, pull past the
+        // threshold, release) and fires [onRefresh], while the only visual it
+        // draws is a hairline's clip container — the sweep itself is [RefreshLine]
+        // below, so nothing appears during the pull. The pull is a deliberate
+        // fallback for "I want it refreshed *now*"; onResume already rescans
+        // silently on every return.
+        PullToRefreshBox(
+            isRefreshing = refreshing,
+            onRefresh = onRefresh,
             modifier = Modifier
+                // Only the top edge is a hard stop — the bar above owns it.
                 .padding(top = innerPadding.calculateTopPadding())
-                .fillMaxSize()
-        ) {
-            AppListPane(
-                apps = apps,
-                multiSelect = multiSelect,
-                selected = selected,
-                lazyListState = lazyListState,
-                onRowClick = onRowClick,
-                onRowLongClick = onRowLongClick,
-                loadIcon = loadIcon,
-                bottomPadding = innerPadding.calculateBottomPadding() + LIST_BOTTOM_PAD
-            )
-            // The whole refresh affordance: a hairline scanning the top edge.
-            // The ring is gone — the scan it stood for is a silent background
-            // task, and a line that sweeps while it runs is the smallest honest
-            // sign of that. Indeterminate by design: the scan has no meaningful
-            // progress to report, only "running" vs "done".
-            RefreshLine(visible = refreshing, modifier = Modifier.align(Alignment.TopCenter))
-        }
+                .fillMaxSize(),
+            indicator = {},
+            content = {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    AppListPane(
+                        apps = apps,
+                        multiSelect = multiSelect,
+                        selected = selected,
+                        lazyListState = lazyListState,
+                        onRowClick = onRowClick,
+                        onRowLongClick = onRowLongClick,
+                        loadIcon = loadIcon,
+                        bottomPadding = innerPadding.calculateBottomPadding() + LIST_BOTTOM_PAD
+                    )
+                    // The whole refresh affordance: a hairline scanning the top
+                    // edge while the scan runs, zipping into a full-width stroke
+                    // when it completes.
+                    RefreshLine(
+                        visible = refreshing,
+                        modifier = Modifier.align(Alignment.TopCenter)
+                    )
+                }
+            }
+        )
     }
 }
 
