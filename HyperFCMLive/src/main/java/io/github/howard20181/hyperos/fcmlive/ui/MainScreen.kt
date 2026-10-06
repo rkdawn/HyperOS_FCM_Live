@@ -3,6 +3,7 @@ package io.github.howard20181.hyperos.fcmlive.ui
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import android.view.HapticFeedbackConstants
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -62,10 +63,11 @@ import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
-import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.PullToRefreshState
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -84,6 +86,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.painter.Painter
@@ -156,10 +159,11 @@ data class MainActions(
 )
 
 /**
- * The whole page: bar, list and pull-to-refresh.
+ * The whole page: bar, list and the refresh hairline.
  *
- * The refresh affordance is the stock M3 [PullToRefreshDefaults.LoadingIndicator] —
- * see the note at its call site for why the custom line is gone.
+ * The list scan is a background task the screen surfaces as a 2dp line
+ * sweeping the top edge ([RefreshLine]); onResume rescans, so the common
+ * path never needs a gesture at all.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -187,8 +191,100 @@ fun MainScreen(
     // messages originate; hosted here, because this is the tree on screen.
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() }
 ) {
-    // The pull's own progress, consumed only by the stock indicator below.
+    // The pull's own progress: 0 at rest, 1 at the commit threshold, >1 past
+    // it. Only read for visuals — the gesture itself belongs to
+    // PullToRefreshBox above.
     val pullState = rememberPullToRefreshState()
+
+    // The gap's position, in "fraction of the full gap" units (0 = closed,
+    // 1 = fully open). While the finger is down it mirrors distanceFraction
+    // 1:1; once the scan commits, a spring takes over and parks it at 1 for
+    // as long as the scan runs (the line needs the room); when both the
+    // finger and the scan are done, the same spring returns it to 0 — the
+    // "检测完再弹回去" the user asked for.
+    //
+    // Frame-economy contract (the second jank fix): the fraction States are
+    // READ ONLY INSIDE the graphicsLayer lambda below. A graphicsLayer block
+    // is a draw-phase observer — reading a State there subscribes the layer
+    // to it without invalidating composition, so a finger moving at 120 Hz
+    // re-runs the layer update and nothing else. The previous revision
+    // computed `gapFraction` in composition scope, which made every gesture
+    // frame a full MainScreen recompose — Scaffold, topBar, the
+    // PullToRefreshBox lambda, all of it. That was the residual jank.
+    // `refreshing` still drives composition (the line's visibility toggles),
+    // but it flips once per scan, not per frame.
+    val gestureFraction = remember { mutableStateOf(0f) }
+    val gapSpring = remember { Animatable(0f) }
+    // Finger tracking stays a composition write (the finger is the animator);
+    // derivedStateOf keeps the recomposition it triggers scoped to the
+    // observers that actually read `gestureOwns`, not the whole screen.
+    //
+    // NOTE: `gestureOwns` deliberately does NOT consult pullState.isAnimating.
+    // The frame drives its fraction with a per-frame snapTo, which restarts
+    // the internal Animatable every frame — isAnimating flickers frame to
+    // frame. A display source chosen on that flag would flip between the
+    // gesture value and the spring's parked 0, and the gap would visibly
+    // blink shut and back every few frames — the "掉一下帧又弹回去" the user
+    // saw. The flag only decides WHO WRITES next (the sequencer below), and
+    // the write path is idempotent per source, so the flicker there is
+    // harmless.
+    val gestureOwns by remember {
+        derivedStateOf {
+            !refreshing && pullState.distanceFraction > 0f
+        }
+    }
+    if (gestureOwns && gestureFraction.value != pullState.distanceFraction) {
+        gestureFraction.value = pullState.distanceFraction
+    }
+    // One sequencer owns the whole lifecycle, in order. The close leg waits
+    // 380ms before pulling the gap down — exactly the duration of the line's
+    // zip-open + fade — so the line finishes its completion read *inside* the
+    // open gap instead of sliding up behind the top bar mid-animation (the
+    // "线跑到最上面" the user saw).
+    var refreshingJustEnded by remember { mutableStateOf(false) }
+    LaunchedEffect(refreshing) {
+        if (!refreshing) {
+            refreshingJustEnded = true
+            delay(600)
+            refreshingJustEnded = false
+        }
+    }
+    LaunchedEffect(refreshing, gestureOwns) {
+        when {
+            gestureOwns -> {
+                // Finger down: make sure the spring is parked.
+                if (gapSpring.value != 0f) gapSpring.snapTo(0f)
+            }
+            refreshing -> {
+                // Scan committed: open to full and hold, from wherever the
+                // finger left it. Default Animatable spec (critical damping,
+                // stiffness 1500) — same curve the framework uses for its
+                // own indicator, and the one that does not read as dropped
+                // frames.
+                val start = maxOf(gestureFraction.value, gapSpring.value)
+                gapSpring.snapTo(start.coerceIn(0f, 1f))
+                gapSpring.animateTo(1f)
+            }
+            else -> {
+                // Finger lifted, no scan: close. Also the scan-just-ended leg —
+                // both arrive here, and both close the gap the same way.
+                // The spring picks up from the larger of the two sources, then
+                // the gesture value retires — AFTER the spring has taken the
+                // hand-off, so no frame renders a closed gap in between.
+                val releasePoint = maxOf(gestureFraction.value, gapSpring.value)
+                if (releasePoint > 0.01f && !gapSpring.isRunning) {
+                    gapSpring.snapTo(releasePoint.coerceIn(0f, 1f))
+                    // Let the line's zip+fade (300+240ms, overlapping) finish
+                    // before the gap itself starts moving.
+                    if (refreshingJustEnded) {
+                        delay(380)
+                    }
+                    gapSpring.animateTo(0f)
+                }
+                gestureFraction.value = 0f
+            }
+        }
+    }
 
     // A finished refresh puts the list back at the top.
     //
@@ -231,12 +327,18 @@ fun MainScreen(
             )
         }
     ) { innerPadding ->
-        // The refresh UI is the stock component again. The custom gap/line
-        // experiment (three revisions) read as jank on the target device and
-        // mis-positioned the line under the top bar; the M3 LoadingIndicator
-        // owns its own placement, animation, and lifecycle, and its motion
-        // runs on the render thread. The gesture and the trigger (pull at the
-        // top of the list) are unchanged — that part was never the problem.
+        // The pull does what the user described: the whole list shifts down,
+        // opening a gap under the bar; the refresh line lives in that gap and
+        // sweeps while the scan runs; when the scan ends the list springs
+        // back. No chevron, no flip, no overlap with the rows — the gap is
+        // reserved by the layout itself, so nothing is ever covered.
+        //
+        // Mechanics: distanceFraction (0 at rest, 1 at the commit threshold)
+        // drives the gap while the finger is down, 1:1. Once the scan starts
+        // (or the finger lifts) a spring owns the offset — the scan holds a
+        // minimum gap open for the line, and when both the finger and the
+        // scan are done it returns to 0. PullToRefreshBox still owns the
+        // gesture recognition; its built-in indicator stays empty.
         PullToRefreshBox(
             isRefreshing = refreshing,
             onRefresh = onRefresh,
@@ -245,31 +347,167 @@ fun MainScreen(
                 // Only the top edge is a hard stop — the bar above owns it.
                 .padding(top = innerPadding.calculateTopPadding())
                 .fillMaxSize(),
-            indicator = {
-                PullToRefreshDefaults.LoadingIndicator(
-                    state = pullState,
-                    isRefreshing = refreshing,
-                    modifier = Modifier.align(Alignment.TopCenter),
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-            },
+            indicator = {},
             content = {
-                AppListPane(
-                    apps = apps,
-                    multiSelect = multiSelect,
-                    selected = selected,
-                    lazyListState = lazyListState,
-                    onRowClick = onRowClick,
-                    onRowLongClick = onRowLongClick,
-                    loadIcon = loadIcon,
-                    bottomPadding = innerPadding.calculateBottomPadding() + LIST_BOTTOM_PAD
-                )
+                // The gap is a FIXED-height block whose visibility is driven by
+                // graphicsLayer translation — a draw-phase-only property. The
+                // previous revision drove a Spacer's height from the animated
+                // fraction, which re-measured the whole list every frame; that
+                // is what the "掉帧" was. Here the closed gap slides up behind
+                // the top bar (negative translation), the open one sits at 0.
+                // The LazyColumn below never re-measures during the animation.
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            // Read the fraction States HERE, not in composition:
+                            // a graphicsLayer block re-runs its update when the
+                            // States it reads change, without invalidating
+                            // composition — the whole point of the frame-economy
+                            // contract above.
+                            //
+                            // Source selection is "whichever is non-zero", not a
+                            // mode flag: the frame's snapTo makes isAnimating
+                            // flicker frame to frame, and a flag-chosen source
+                            // would blink the gap shut on every flickering frame
+                            // (the spring sits at 0 while the gesture value
+                            // still holds the pull). max() of both is continuous
+                            // through every hand-off — gesture → spring open,
+                            // spring → gesture close, all monotonic.
+                            val f = maxOf(gestureFraction.value, gapSpring.value)
+                            val gapPx = (GAP_REST + GAP_TRAVEL * f).toPx()
+                            translationY = gapPx - (GAP_REST + GAP_TRAVEL).toPx()
+                        }
+                ) {
+                    // Fixed-height gap block: the sweeping line lives here.
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(GAP_REST + GAP_TRAVEL)
+                    ) {
+                        RefreshLine(
+                            visible = refreshing,
+                            modifier = Modifier.align(Alignment.TopCenter)
+                        )
+                    }
+                    AppListPane(
+                        apps = apps,
+                        multiSelect = multiSelect,
+                        selected = selected,
+                        lazyListState = lazyListState,
+                        onRowClick = onRowClick,
+                        onRowLongClick = onRowLongClick,
+                        loadIcon = loadIcon,
+                        bottomPadding = innerPadding.calculateBottomPadding() + LIST_BOTTOM_PAD
+                    )
+                }
             }
         )
     }
 }
 
+
+/**
+ * The refresh affordance: a 2dp hairline at the very top of the list, sweeping
+ * left↔right for as long as the scan runs.
+ *
+ * Indeterminate on purpose. A ring implied "pull to refresh" as a first-class
+ * gesture; the gesture is now a fallback (onResume rescans automatically, so
+ * the common path never needs it), and the only honest claim this screen makes
+ * while scanning is "a scan is running" — no progress, no completion circle,
+ * no bounce. The line appears by fading in, sweeps on an infinite transition,
+ * and fades out when the scan ends; everything reads inside the draw scope, so
+ * the sweep costs draw passes only.
+ */
+@Composable
+private fun RefreshLine(visible: Boolean, modifier: Modifier = Modifier) {
+    val lineColor = MaterialTheme.colorScheme.primary
+    val sweep = rememberInfiniteTransition(label = "refresh-line")
+    val phase = sweep.animateFloat(
+        initialValue = -1f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "refresh-line-phase"
+    )
+    val alpha = remember { Animatable(0f) }
+    // The completion leg. 0 = the segment where the sweep left it; 1 = the
+    // line closed into one full-width stroke. Frozen start/end are captured
+    // the moment the scan ends, so the close-up begins where the eye last
+    // saw the segment instead of jumping to an edge.
+    val completion = remember { Animatable(1f) }
+    var doneStart by remember { mutableStateOf(0f) }
+    var doneEnd by remember { mutableStateOf(1f) }
+
+    LaunchedEffect(visible) {
+        if (visible) {
+            // A new scan: reset the close-up and ride the fade in.
+            completion.snapTo(0f)
+            alpha.animateTo(1f, tween(durationMillis = 200))
+        } else if (alpha.value > 0.01f) {
+            // Scan finished. The segment zips open into a full-width line —
+            // tail runs to the left edge, head to the right — and the whole
+            // stroke fades. One decisive "done", the Chrome progress-bar
+            // completion read, instead of the sweep just evaporating.
+            val head = (phase.value + 1f) / 2f
+            doneStart = (head - REFRESH_LINE_SEGMENT).coerceAtLeast(0f)
+            doneEnd = head.coerceAtLeast(doneStart)
+            completion.snapTo(0f)
+            completion.animateTo(
+                1f,
+                tween(durationMillis = 300, easing = FastOutSlowInEasing)
+            )
+            alpha.animateTo(0f, tween(durationMillis = 240))
+        }
+    }
+
+    Canvas(modifier = modifier.fillMaxWidth().height(REFRESH_LINE_THICKNESS)) {
+        val a = alpha.value
+        if (a <= 0.01f) {
+            return@Canvas
+        }
+        val w = size.width
+        val startF: Float
+        val endF: Float
+        if (!visible) {
+            // Done leg: interpolate the frozen segment out to full width.
+            val c = completion.value
+            startF = doneStart + (0f - doneStart) * c
+            endF = doneEnd + (1f - doneEnd) * c
+        } else {
+            // Sweeping: short segment travelling the width, tail behind.
+            val head = (phase.value + 1f) / 2f
+            endF = head
+            startF = (head - REFRESH_LINE_SEGMENT).coerceAtLeast(0f)
+        }
+        drawLine(
+            color = lineColor,
+            start = Offset(startF * w, size.height / 2f),
+            end = Offset(endF * w, size.height / 2f),
+            strokeWidth = size.height,
+            alpha = a,
+            cap = StrokeCap.Round
+        )
+    }
+}
+
+/** The gap's closed height: enough for the hairline to live in at rest. */
+private val GAP_REST = 4.dp
+
+/** How far past rest the fully-open gap reaches, at the commit threshold. */
+private val GAP_TRAVEL = 40.dp
+
+/** Thickness of the top refresh hairline. 3dp: 2dp read as too faint to spot. */
+private val REFRESH_LINE_THICKNESS = 3.dp
+
+/**
+ * Sweeping segment length as a fraction of the line's width. 0.22 was easy to
+ * lose against a full-width list; 0.40 covers enough of the screen that the
+ * motion catches the eye at a glance.
+ */
+private const val REFRESH_LINE_SEGMENT = 0.40f
 
 /** Bottom padding the last list card keeps above the navigation-bar inset. */
 private val LIST_BOTTOM_PAD = 16.dp

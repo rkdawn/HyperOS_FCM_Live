@@ -317,11 +317,12 @@ private fun buildRows(context: Context): List<DiagRow> {
         false
     }
 
-    // GMS running? ActivityManager.runningAppProcesses is not a cross-app
-    // signal on modern Android (it returns our own process only), so this
-    // needs root: a pidof lookup. Falls back to false without root — the
-    // same degradation the root rows use.
-    val gmsRunning = rootProcessAlive(GMS_PACKAGE)
+    // GMS running? Process importance <= CACHED means it is alive and warm;
+    // an empty list only means "not started since boot", which is itself
+    // worth saying.
+    val gmsRunning = am != null && am.runningAppProcesses.orEmpty().any {
+        it.processName == GMS_PACKAGE || it.processName.startsWith("$GMS_PACKAGE:")
+    }
 
     // The push dispatch machinery. GcmReceiver is the legacy entry — newer
     // GMS builds ship different receiver classes and a foreground service
@@ -523,9 +524,10 @@ private object RootProbe {
             val gmsLimitOff = gmsLimitLine?.contains("false") ?: true // absent → treat as off
 
             // 3. The module's own install summary proves the hook code is live
-            //    in this boot. LSPosed's module log carries it — libxposed
-            //    log() never reaches the logcat main buffer.
-            val hookActive = readModuleLog().any { it.contains("hook(s) installed") }
+            //    in this boot: the log buffer filtered to the module's tag.
+            val logs = com.topjohnwu.superuser.Shell
+                .cmd("logcat -d -s HyperGreeze -t 500").exec().out
+            val hookActive = logs.any { it.contains("hook(s) installed") }
 
             return Result(
                 unavailable = false,
@@ -567,14 +569,18 @@ private data class ActivityEvent(
  * on the device.
  */
 private fun readActivityLog(context: Context): List<ActivityEvent> {
-    val out = readModuleLog()
+    val out = try {
+        com.topjohnwu.superuser.Shell
+            .cmd("logcat -d -s HyperGreeze -t 800").exec().out
+    } catch (t: Throwable) {
+        return emptyList()
+    }
     val events = ArrayList<ActivityEvent>()
     for (line in out) {
         // Format: "10-06 23:12:45.123 I/HyperGreeze: <message>" (some builds
         // prepend pid/uid columns; the regex tolerates both).
         val m = LOG_LINE.matchEntire(line.trim()) ?: continue
-        val stamp = m.groupValues[1]
-        val msg = msgOf(m.groupValues[2])
+        val (stamp, msg) = m.destructured
         val time = stamp.substring(0, 12)
         val event = when {
             // Every delivered push (per-delivery line, not one-shot).
@@ -741,36 +747,8 @@ private fun fmtBytes(b: Long): String {
     return if (kb >= 1024) "%.1f MB".format(kb / 1024) else "%.1f KB".format(kb)
 }
 
-// LSPosed's modules.log lines carry a leading MM-DD HH:MM:SS.mmm stamp, then
-// level/pid/tid/module columns whose exact layout varies by LSPosed version.
-// Only the stamp is structural; the message is located by its own business
-// prefixes (delivery:, gms probe [, ...) which are unambiguous, so the
-// regex captures the stamp and the whole remainder as the payload.
-
-/**
- * Strips the variable level/pid/tid/module columns from a modules.log payload
- * line, leaving the module's own message. The message's known prefixes are
- * the anchor: the earliest one found wins, and a line without any is dropped
- * by the caller's when-branches anyway.
- */
-private val MSG_ANCHORS = listOf(
-    "delivery: ", "isAllowBroadcast: ", "gms probe", "checkAlarmIsAllowedSend: ",
-    "udpPackageRestrict: ", "AppStandbyController#setUidState: ", "doze-wl-sentinel: ",
-    "P3: ", "MILLET_NO_RESTRICT_APP: ", "userTable: ", "standby-firewall: ",
-    "socket-teardown probe", "wake-path probe: ", "sleep-mode: ", "P4: ",
-    "Hot reload requested", "HyperFCMLive active in "
-)
-
-private fun msgOf(payload: String): String {
-    var best = -1
-    for (anchor in MSG_ANCHORS) {
-        val i = payload.indexOf(anchor)
-        if (i >= 0 && (best < 0 || i < best)) best = i
-    }
-    return if (best >= 0) payload.substring(best) else payload
-}
 private val LOG_LINE = Regex(
-    """^(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\s+(.*)$"""
+    """^(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\s+[VDIWEF]/\w+\s*\(?\s*\d*\)?\s*:?\s*(.*)$"""
 )
 
 /** One live TCP socket owned by GMS (or GSF — same uid family). */
@@ -1007,12 +985,17 @@ private data class AppStat(
  * label resolves through the package manager so rows read as app names.
  */
 private fun aggregateAppStats(context: Context): List<AppStat> {
-    val out = readModuleLog()
+    val out = try {
+        com.topjohnwu.superuser.Shell
+            .cmd("logcat -d -s HyperGreeze -t 2000").exec().out
+    } catch (t: Throwable) {
+        return emptyList()
+    }
     data class Acc(val count: Int, val lastStamp: String)
     val counts = HashMap<String, Acc>()
     for (line in out) {
         val m = LOG_LINE.matchEntire(line.trim()) ?: continue
-        val msg = msgOf(m.groupValues[2])
+        val msg = m.groupValues[2]
         if (!msg.startsWith("delivery: pkg=")) continue
         val pkg = msg.substringAfter("pkg=").substringBefore(' ').ifEmpty { continue }
         val stamp = m.groupValues[1]
@@ -1103,34 +1086,5 @@ private fun AppStatView(stat: AppStat) {
                 )
             }
         }
-    }
-}
-
-/**
- * The module's own log lines. libxposed's XposedModule.log() writes LSPosed's
- * module log file — it never reaches the logcat main buffer, which is why the
- * logcat-based reads were always empty. The primary path is stable across
- * LSPosed releases; the find covers forks that move it. Non-root readers get
- * an empty list and the "needs root" verdicts.
- */
-private fun readModuleLog(): List<String> {
-    return try {
-        val r = com.topjohnwu.superuser.Shell.cmd(
-            "cat /data/adb/lspd/log/modules.log 2>/dev/null",
-            "find /data/adb/lspd/log -name 'modules.log' 2>/dev/null | head -1 | xargs cat 2>/dev/null"
-        ).exec()
-        r.out
-    } catch (t: Throwable) {
-        emptyList()
-    }
-}
-
-/** True when any process of [pkg] is alive, via the root process table. */
-private fun rootProcessAlive(pkg: String): Boolean {
-    return try {
-        com.topjohnwu.superuser.Shell
-            .cmd("pidof $pkg").exec().out.any { it.isNotBlank() }
-    } catch (t: Throwable) {
-        false
     }
 }
