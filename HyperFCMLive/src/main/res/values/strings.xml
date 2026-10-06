@@ -129,6 +129,11 @@
     <string name="fcm_diagnostics_not_found">当前设备无法打开 FCM 诊断界面</string>
     <string name="diag_section_gms">谷歌服务框架</string>
     <string name="diag_section_connection">连接状态（root 检测）</string>
+    <string name="diag_section_sockets">GMS 网络连接</string>
+    <string name="diag_sockets_none">当前没有 GMS 的活动连接（进程未运行或已断网）</string>
+    <string name="diag_section_activity">最近推送活动</string>
+    <string name="diag_activity_none">日志里暂无推送事件记录——等一条推送进来，或点右上角刷新</string>
+    <string name="diag_refresh">刷新</string>
     <string name="diag_section_module">模块状态</string>
     <string name="diag_loading">正在检测（root 检测需要几秒）…</string>
     <string name="diag_mcs_socket">MCS 长连接</string>

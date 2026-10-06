@@ -26,6 +26,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
@@ -119,16 +122,51 @@ fun FcmDiagnosticsScreen(
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val rows = remember { mutableStateOf<List<DiagRow>>(emptyList()) }
-    // The root leg shells out four commands; never on the main thread.
-    LaunchedEffect(Unit) {
-        val nonRoot = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-            buildRows(context)
+    // The activity log: recent push deliveries and MCS socket details, read
+    // from the hook's own logcat output. Reloaded on demand (pull of the
+    // refresh button), not on a timer — the log buffer is what it is.
+    val activity = remember { mutableStateOf<List<ActivityEvent>>(emptyList()) }
+    val sockets = remember { mutableStateOf<List<McsSocket>>(emptyList()) }
+    val busy = remember { mutableStateOf(false) }
+
+    suspend fun reload() {
+        busy.value = true
+        val (r, ev, sk) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            val r = buildRows(context)
+            val ev = readActivityLog()
+            val sk = readMcsSockets(context)
+            Triple(r, ev, sk)
         }
-        rows.value = nonRoot
+        rows.value = r
+        activity.value = ev
+        sockets.value = sk
+        busy.value = false
     }
 
+    LaunchedEffect(Unit) { reload() }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+
     Column(modifier = Modifier.fillMaxSize()) {
-        AppTopBar(titleRes = R.string.fcm_diagnostics, onBack = onBack)
+        AppTopBar(
+            titleRes = R.string.fcm_diagnostics,
+            onBack = onBack,
+            actions = {
+                androidx.compose.material3.TextButton(
+                    onClick = { scope.launch { reload() } },
+                    enabled = !busy.value
+                ) {
+                    Text(
+                        text = stringResource(R.string.diag_refresh),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (busy.value) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        }
+                    )
+                }
+            }
+        )
         val loading = rows.value.isEmpty()
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
@@ -153,9 +191,39 @@ fun FcmDiagnosticsScreen(
                 items(rows.value.filter { it.group == DiagRow.Group.CONNECTION }, key = { it.titleRes }) { row ->
                     DiagRowView(row, onOpenGmsDiagnostics)
                 }
+                item { SectionTitle(res = R.string.diag_section_sockets) }
+                if (sockets.value.isEmpty()) {
+                    item {
+                        Text(
+                            text = stringResource(R.string.diag_sockets_none),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 8.dp)
+                        )
+                    }
+                } else {
+                    items(sockets.value, key = { it.key }) { s ->
+                        McsSocketView(s)
+                    }
+                }
                 item { SectionTitle(res = R.string.diag_section_module) }
                 items(rows.value.filter { it.group == DiagRow.Group.MODULE }, key = { it.titleRes }) { row ->
                     DiagRowView(row, onOpenGmsDiagnostics)
+                }
+                item { SectionTitle(res = R.string.diag_section_activity) }
+                if (activity.value.isEmpty()) {
+                    item {
+                        Text(
+                            text = stringResource(R.string.diag_activity_none),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 8.dp)
+                        )
+                    }
+                } else {
+                    items(activity.value, key = { it.key }) { ev ->
+                        ActivityEventView(ev)
+                    }
                 }
                 item {
                     Spacer(modifier = Modifier.height(16.dp))
@@ -340,18 +408,18 @@ private object RootProbe {
         val noRoot = Result(
             unavailable = true, mcsEstablished = false, gmsLimitOff = false, hookActive = false
         )
-        // libsu 6: the static entry points build/await the shell themselves.
-        // `rootAccess()` returns null while the grant dialog is still pending.
-        val granted = try {
-            com.topjohnwu.superuser.Shell.isAppGrantedRoot() == true ||
-                com.topjohnwu.superuser.Shell.rootAccess() == true
-        } catch (t: Throwable) {
-            false
-        }
-        if (!granted) {
-            return noRoot
-        }
         try {
+            // Probe by command, not by cached state: isAppGrantedRoot() returns
+            // null until a shell has been built at least once, so a fresh
+            // process reads as "not granted" even when Magisk already allowed
+            // us. `id` both builds the shell (awaiting the grant dialog if it
+            // is still up) and proves the uid.
+            val id = com.topjohnwu.superuser.Shell.cmd("id").exec()
+            val granted = id.isSuccess && id.out.any { it.contains("uid=0") }
+            if (!granted) {
+                return noRoot
+            }
+
             // 1. MCS socket: /proc/net/tcp is root-readable again under su.
             //    GMS's uid comes from the package manager on the calling thread.
             val uidOut = com.topjohnwu.superuser.Shell
@@ -397,6 +465,201 @@ private object RootProbe {
 private const val GMS_PACKAGE = "com.google.android.gms"
 private const val GSF_PACKAGE = "com.google.android.gsf"
 private const val GCM_DIAGNOSTICS = "com.google.android.gms.gcm.GcmDiagnostics"
+
+// ---------------------------------------------------------------------------
+// Activity log + MCS socket readers (root). Pure functions over shell output;
+// every parse failure degrades to an empty/absent entry, never a throw.
+// ---------------------------------------------------------------------------
+
+/** One recent push-related event, parsed from the hook's own logcat output. */
+@Immutable
+private data class ActivityEvent(
+    val key: String,
+    val time: String,
+    /** Short verb: 已送达 / 已放行 / 已拦截 / 流量 … */
+    val verb: String,
+    /** The app or subject the event is about, human-readable. */
+    val subject: String,
+    val good: Boolean
+)
+
+/**
+ * Reads the module's recent runtime events from the log buffer. The hooker
+ * logs every gate decision it makes with stable prefixes, so the log IS the
+ * activity feed — no new hook, no new storage, just parsing what is already
+ * on the device.
+ */
+private fun readActivityLog(): List<ActivityEvent> {
+    val out = try {
+        com.topjohnwu.superuser.Shell
+            .cmd("logcat -d -s HyperGreeze -t 800").exec().out
+    } catch (t: Throwable) {
+        return emptyList()
+    }
+    val events = ArrayList<ActivityEvent>()
+    for (line in out) {
+        // Format: "10-06 23:12:45.123 I/HyperGreeze: <message>" (some builds
+        // prepend pid/uid columns; the regex tolerates both).
+        val m = LOG_LINE.matchEntire(line.trim()) ?: continue
+        val (stamp, level, msg) = m.destructured
+        val event = when {
+            msg.startsWith("isAllowBroadcast: c2dm allowed for callee=") -> ActivityEvent(
+                key = "alb-${events.size}-$stamp",
+                time = stamp.substring(0, 12),
+                verb = "已送达",
+                subject = msg.substringAfter("callee=").substringBefore(' ')
+                    .ifEmpty { "未知应用" },
+                good = true
+            )
+            msg.startsWith("isAllowBroadcast: c2dm not intercepted for") -> ActivityEvent(
+                key = "skip-${events.size}-$stamp",
+                time = stamp.substring(0, 12),
+                verb = "未接管",
+                subject = msg.substringAfter("callee=").substringBefore(' ')
+                    .ifEmpty { "未知应用" } + "（严格模式未勾选）",
+                good = false
+            )
+            msg.startsWith("gms probe [") -> {
+                val rx = Regex("rx=\\+?(\\d+)B").find(msg)?.groupValues?.get(1)?.toLongOrNull()
+                val tx = Regex("tx=\\+?(\\d+)B").find(msg)?.groupValues?.get(1)?.toLongOrNull()
+                if (rx != null && tx != null) {
+                    ActivityEvent(
+                        key = "probe-${events.size}-$stamp",
+                        time = stamp.substring(0, 12),
+                        verb = "GMS 流量",
+                        subject = "收 ${(rx / 1024.0).let { if (it >= 1024) "%.1f MB".format(it / 1024) else "%.1f KB".format(it) }}，发 ${(tx / 1024.0).let { if (it >= 1024) "%.1f MB".format(it / 1024) else "%.1f KB".format(it) }}",
+                        good = rx > 0 || tx > 0
+                    )
+                } else null
+            }
+            msg.startsWith("checkAlarmIsAllowedSend: re-allowed denied GMS alarm") -> ActivityEvent(
+                key = "alarm-${events.size}-$stamp",
+                time = stamp.substring(0, 12),
+                verb = "已放行",
+                subject = "GMS 心跳闹钟（系统原本拒绝）",
+                good = true
+            )
+            msg.startsWith("udpPackageRestrict: skipped UDP filter for GMS") -> ActivityEvent(
+                key = "udp-${events.size}-$stamp",
+                time = stamp.substring(0, 12),
+                verb = "已拦截",
+                subject = "系统对 GMS 的 UDP 过滤",
+                good = true
+            )
+            msg.startsWith("AppStandbyController#setUidState: kept GMS") -> ActivityEvent(
+                key = "sb-${events.size}-$stamp",
+                time = stamp.substring(0, 12),
+                verb = "已保活",
+                subject = "GMS 待机限制（系统试图收紧）",
+                good = true
+            )
+            msg.startsWith("sleep-mode: kept WiFi on") -> ActivityEvent(
+                key = "sw-${events.size}-$stamp",
+                time = stamp.substring(0, 12),
+                verb = "睡眠保活",
+                subject = "WiFi（睡眠模式原本会关闭）",
+                good = true
+            )
+            msg.startsWith("sleep-mode: kept mobile data on") -> ActivityEvent(
+                key = "sd-${events.size}-$stamp",
+                time = stamp.substring(0, 12),
+                verb = "睡眠保活",
+                subject = "移动数据（睡眠模式原本会关闭）",
+                good = true
+            )
+            msg.startsWith("P4: recovery broadcasts sent") -> ActivityEvent(
+                key = "rec-${events.size}-$stamp",
+                time = stamp.substring(0, 12),
+                verb = "重连",
+                subject = "已请求 GMS/GSF 重连推送",
+                good = true
+            )
+            else -> null
+        }
+        if (event != null) {
+            events.add(event)
+        }
+    }
+    // Newest first; the buffer is chronological. Cap for scroll health.
+    return events.takeLast(30).reversed()
+}
+
+private val LOG_LINE = Regex(
+    """^(?\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\s+[VDIWEF]/\w+\s*\(?\s*\d*\)?\s*:?\s*(.*)$"""
+)
+
+/** One live TCP socket owned by GMS (or GSF — same uid family). */
+@Immutable
+private data class McsSocket(
+    val key: String,
+    val remote: String,
+    val port: Int,
+    val established: Boolean,
+    /** True when the remote port is a Google-push endpoint (5228-5230, 443). */
+    val push: Boolean
+)
+
+private fun readMcsSockets(context: Context): List<McsSocket> {
+    val pm = context.packageManager
+    val uid = try {
+        pm.getApplicationInfo(GMS_PACKAGE, 0).uid
+    } catch (t: Throwable) {
+        return emptyList()
+    }
+    val out = try {
+        com.topjohnwu.superuser.Shell
+            .cmd("cat /proc/net/tcp", "cat /proc/net/tcp6").exec().out
+    } catch (t: Throwable) {
+        return emptyList()
+    }
+    val sockets = ArrayList<McsSocket>()
+    for (line in out) {
+        val cols = line.trim().split(Regex("\\s+"))
+        if (cols.size < 10 || cols[0] == "sl") continue
+        // sl local_address rem_address st tx:rx tr:tmwhen retrnsmt uid
+        val uidCol = cols[7].toIntOrNull() ?: continue
+        if (uidCol != uid) continue
+        val remHex = cols[2]
+        val state = cols[3]
+        val established = state == "01"
+        val (ip, port) = parseHexAddr(remHex) ?: continue
+        sockets.add(
+            McsSocket(
+                key = "${cols[1]}-${cols[2]}",
+                remote = ip,
+                port = port,
+                established = established,
+                push = port in intArrayOf(5228, 5229, 5230, 443)
+            )
+        )
+    }
+    // Established first, then push ports first.
+    return sockets.sortedWith(
+        compareByDescending<McsSocket> { it.established }.thenByDescending { it.push }
+    ).take(8)
+}
+
+/** "/proc/net/tcp" address columns: ABBBBBBBCCDDEEFF:PORT (IPv4) — hex, little-endian per byte group. */
+private fun parseHexAddr(col: String): Pair<String, Int>? {
+    val parts = col.split(":")
+    if (parts.size != 2) return null
+    val port = parts[1].toIntOrNull(16) ?: return null
+    val hex = parts[0]
+    val ip = if (hex.length == 8) {
+        // IPv4: 4 little-endian bytes.
+        try {
+            (0 until 4).reversed().joinToString(".") { i ->
+                hex.substring(i * 2, i * 2 + 2).toInt(16).toString()
+            }
+        } catch (t: Throwable) {
+            return null
+        }
+    } else {
+        // IPv6: too wide to be useful in a row; label it.
+        "IPv6"
+    }
+    return ip to port
+}
 
 /**
  * One verdict row: leading mark, title, one-line detail. Action rows swap the
@@ -453,6 +716,82 @@ private fun DiagRowView(row: DiagRow, onOpenGmsDiagnostics: () -> Unit) {
                     } else {
                         MaterialTheme.colorScheme.error
                     }
+                )
+            }
+        }
+    }
+}
+
+/**
+ * One live GMS socket row: remote endpoint, state, and a push-port mark.
+ * Monospace-ish emphasis on the endpoint — it is the address the eye scans.
+ */
+@Composable
+private fun McsSocketView(s: McsSocket) {
+    GroupRow(first = true, last = true, onClick = null) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "${s.remote}:${s.port}",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = when {
+                        s.established && s.push -> "已连接 · 谷歌推送端口"
+                        s.established -> "已连接"
+                        else -> "未连接（TIME_WAIT/CLOSE 等）"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (s.established && s.push) {
+                Text(
+                    text = stringResource(R.string.diag_ok),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+    }
+}
+
+/** One recent event: time, verb chip, subject. */
+@Composable
+private fun ActivityEventView(ev: ActivityEvent) {
+    GroupRow(first = true, last = true, onClick = null) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = ev.time,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = ev.verb,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (ev.good) {
+                        MaterialTheme.colorScheme.onSurface
+                    } else {
+                        MaterialTheme.colorScheme.error
+                    }
+                )
+                Text(
+                    text = ev.subject,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
