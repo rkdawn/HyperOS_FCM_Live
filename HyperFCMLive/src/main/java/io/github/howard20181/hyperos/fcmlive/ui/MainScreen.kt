@@ -104,6 +104,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import io.github.howard20181.hyperos.fcmlive.R
 import io.github.howard20181.hyperos.fcmlive.theme.HyperFCMLiveTheme
 import io.github.howard20181.hyperos.fcmlive.theme.LocalAppShapes
@@ -216,6 +217,19 @@ fun MainScreen(
     if (gestureOwns && gesture != frameFraction) {
         gesture = frameFraction
     }
+    // One sequencer owns the whole lifecycle, in order. The close leg waits
+    // 380ms before pulling the gap down — exactly the duration of the line's
+    // zip-open + fade — so the line finishes its completion read *inside* the
+    // open gap instead of sliding up behind the top bar mid-animation (the
+    // "线跑到最上面" the user saw).
+    var refreshingJustEnded by remember { mutableStateOf(false) }
+    LaunchedEffect(refreshing) {
+        if (!refreshing) {
+            refreshingJustEnded = true
+            delay(600)
+            refreshingJustEnded = false
+        }
+    }
     LaunchedEffect(refreshing, gestureOwns) {
         when {
             gestureOwns -> {
@@ -238,6 +252,11 @@ fun MainScreen(
                 val releasePoint = maxOf(gesture, gapSpring.value)
                 if (releasePoint > 0.01f && !gapSpring.isRunning) {
                     gapSpring.snapTo(releasePoint.coerceIn(0f, 1f))
+                    // Let the line's zip+fade (300+240ms, overlapping) finish
+                    // before the gap itself starts moving.
+                    if (refreshingJustEnded) {
+                        delay(380)
+                    }
                     gapSpring.animateTo(0f)
                 }
                 gesture = 0f

@@ -132,6 +132,11 @@
     <string name="diag_section_sockets">GMS 网络连接</string>
     <string name="diag_sockets_none">当前没有 GMS 的活动连接（进程未运行或已断网）</string>
     <string name="diag_section_activity">最近推送活动</string>
+    <string name="diag_section_apps">应用推送统计（本次开机）</string>
+    <string name="diag_apps_none">本开机周期内暂无 FCM 推送记录</string>
+    <string name="diag_deliveries">%1$d 次推送</string>
+    <string name="diag_disconnects">MCS 掉线次数</string>
+    <string name="diag_disconnects_detail">模块检测期间观察到长连接断开的次数（0 = 一直在线）</string>
     <string name="diag_activity_none">日志里暂无推送事件记录——等一条推送进来，或点右上角刷新</string>
     <string name="diag_refresh">刷新</string>
     <string name="diag_section_module">模块状态</string>

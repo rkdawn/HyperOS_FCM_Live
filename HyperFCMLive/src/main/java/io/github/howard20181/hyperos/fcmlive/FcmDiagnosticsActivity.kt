@@ -127,19 +127,33 @@ fun FcmDiagnosticsScreen(
     // refresh button), not on a timer — the log buffer is what it is.
     val activity = remember { mutableStateOf<List<ActivityEvent>>(emptyList()) }
     val sockets = remember { mutableStateOf<List<McsSocket>>(emptyList()) }
+    // Per-app FCM statistics: which apps the hook saw receiving pushes, how
+    // many, last seen — aggregated from the hook's own log output. The
+    // per-session disconnect count rides beside it (GMS socket transitions
+    // observed between refreshes).
+    val perApp = remember { mutableStateOf<List<AppStat>>(emptyList()) }
+    val disconnects = remember { mutableStateOf(0) }
     val busy = remember { mutableStateOf(false) }
 
     suspend fun reload() {
         busy.value = true
-        val (r, ev, sk) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-            val r = buildRows(context)
-            val ev = readActivityLog()
-            val sk = readMcsSockets(context)
-            Triple(r, ev, sk)
+        val r: List<DiagRow>
+        val ev: List<ActivityEvent>
+        val sk: List<McsSocket>
+        val pa: List<AppStat>
+        val dc: Int
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            r = buildRows(context)
+            ev = readActivityLog()
+            sk = readMcsSockets(context)
+            pa = aggregateAppStats()
+            dc = countDisconnects(context)
         }
         rows.value = r
         activity.value = ev
         sockets.value = sk
+        perApp.value = pa
+        disconnects.value = dc
         busy.value = false
     }
 
@@ -204,6 +218,53 @@ fun FcmDiagnosticsScreen(
                 } else {
                     items(sockets.value, key = { it.key }) { s ->
                         McsSocketView(s)
+                    }
+                }
+                item { SectionTitle(res = R.string.diag_section_apps) }
+                item {
+                    GroupRow(first = true, last = true, onClick = null) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = stringResource(R.string.diag_disconnects),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = stringResource(R.string.diag_disconnects_detail),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Text(
+                                text = disconnects.value.toString(),
+                                style = MaterialTheme.typography.titleMedium,
+                                color = if (disconnects.value > 0) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                }
+                            )
+                        }
+                    }
+                }
+                if (perApp.value.isEmpty()) {
+                    item {
+                        Text(
+                            text = stringResource(R.string.diag_apps_none),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 8.dp)
+                        )
+                    }
+                } else {
+                    items(perApp.value, key = { it.pkg }) { stat ->
+                        AppStatView(stat)
                     }
                 }
                 item { SectionTitle(res = R.string.diag_section_module) }
@@ -791,6 +852,127 @@ private fun ActivityEventView(ev: ActivityEvent) {
                 Text(
                     text = ev.subject,
                     style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+/** Per-app FCM push statistics, aggregated from the hook's log output. */
+@Immutable
+private data class AppStat(
+    val pkg: String,
+    val label: String,
+    val deliveries: Int,
+    /** Time of the most recent delivery, as logged. */
+    val lastSeen: String
+)
+
+/**
+ * Aggregates the per-app delivery counts from the log buffer. The hooker
+ * logs one "c2dm allowed for callee=<pkg>" line per delivered push (plus
+ * one-shot firsts), so counting log lines IS counting deliveries within the
+ * buffer's retention (~a few hours on a busy device).
+ */
+private fun aggregateAppStats(): List<AppStat> {
+    val out = try {
+        com.topjohnwu.superuser.Shell
+            .cmd("logcat -d -s HyperGreeze -t 2000").exec().out
+    } catch (t: Throwable) {
+        return emptyList()
+    }
+    data class Acc(val count: Int, val lastStamp: String)
+    val counts = HashMap<String, Acc>()
+    for (line in out) {
+        val m = LOG_LINE.matchEntire(line.trim()) ?: continue
+        val msg = m.groupValues[2]
+        if (!msg.startsWith("isAllowBroadcast: c2dm allowed for callee=")) continue
+        val pkg = msg.substringAfter("callee=").substringBefore(' ').ifEmpty { continue }
+        val stamp = m.groupValues[1]
+        val prev = counts[pkg]
+        counts[pkg] = if (prev == null) Acc(1, stamp) else Acc(prev.count + 1, prev.lastStamp)
+    }
+    return counts.entries
+        .sortedByDescending { it.value.count }
+        .take(15)
+        .map { (pkg, acc) ->
+            AppStat(
+                pkg = pkg,
+                label = pkg.substringAfterLast('.'),
+                deliveries = acc.count,
+                lastSeen = acc.lastStamp.substring(0, 12)
+            )
+        }
+}
+
+/**
+ * GMS connection continuity, root: compares the *uptime of the current MCS
+ * connection* against time since boot. The log buffer's "gms probe" lines
+ * carry rx/tx deltas every 30 minutes; a probe with exactly zero traffic is
+ * normal overnight, so instead of guessing from traffic this counts how many
+ * times the MCS socket was observed absent across this session's refreshes.
+ * The count lives in a small root-written marker file so it survives the
+ * activity being recreated (rotation, theme change) — not across reboots,
+ * which matches "本会话掉了几次" without a foreground service.
+ */
+private fun countDisconnects(context: Context): Int {
+    val establishedNow = readMcsSockets(context).any { it.established && it.push }
+    val marker = java.io.File(context.cacheDir, "mcs_session_state")
+    // Format: two lines — "wasEstablished", "disconnectCount".
+    val previous: Pair<Boolean, Int> = try {
+        val lines = marker.readLines()
+        (lines.getOrNull(0) == "1") to (lines.getOrNull(1)?.toIntOrNull() ?: 0)
+    } catch (t: Throwable) {
+        false to 0
+    }
+    var count = previous.second
+    if (previous.first && !establishedNow) {
+        count += 1
+    }
+    try {
+        marker.writeText("${if (establishedNow) 1 else 0}\n$count")
+    } catch (t: Throwable) {
+    }
+    return count
+}
+
+/** One per-app FCM statistic row. */
+@Composable
+private fun AppStatView(stat: AppStat) {
+    GroupRow(first = true, last = true, onClick = null) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stat.label,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = stat.pkg,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    text = stringResource(R.string.diag_deliveries, stat.deliveries),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = stat.lastSeen,
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
