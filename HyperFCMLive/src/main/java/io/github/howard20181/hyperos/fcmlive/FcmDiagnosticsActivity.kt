@@ -109,7 +109,7 @@ private data class DiagRow(
     val action: Action? = null
 ) {
     enum class Action { OPEN_GMS_DIAGNOSTICS }
-    enum class Group { GMS, MODULE }
+    enum class Group { GMS, CONNECTION, MODULE }
 }
 
 @Composable
@@ -119,32 +119,53 @@ fun FcmDiagnosticsScreen(
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val rows = remember { mutableStateOf<List<DiagRow>>(emptyList()) }
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        rows.value = buildRows(context)
+    // The root leg shells out four commands; never on the main thread.
+    LaunchedEffect(Unit) {
+        val nonRoot = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            buildRows(context)
+        }
+        rows.value = nonRoot
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
         AppTopBar(titleRes = R.string.fcm_diagnostics, onBack = onBack)
+        val loading = rows.value.isEmpty()
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
         ) {
-            item { SectionTitle(res = R.string.diag_section_gms, first = true) }
-            items(rows.value.filter { it.group == DiagRow.Group.GMS }, key = { it.titleRes }) { row ->
-                DiagRowView(row, onOpenGmsDiagnostics)
-            }
-            item { SectionTitle(res = R.string.diag_section_module) }
-            items(rows.value.filter { it.group == DiagRow.Group.MODULE }, key = { it.titleRes }) { row ->
-                DiagRowView(row, onOpenGmsDiagnostics)
-            }
-            item {
-                Spacer(modifier = Modifier.height(16.dp))
-                Text(
-                    text = stringResource(R.string.diag_footer),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 8.dp)
-                )
+            if (loading) {
+                item {
+                    Spacer(modifier = Modifier.height(32.dp))
+                    Text(
+                        text = stringResource(R.string.diag_loading),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                }
+            } else {
+                item { SectionTitle(res = R.string.diag_section_gms, first = true) }
+                items(rows.value.filter { it.group == DiagRow.Group.GMS }, key = { it.titleRes }) { row ->
+                    DiagRowView(row, onOpenGmsDiagnostics)
+                }
+                item { SectionTitle(res = R.string.diag_section_connection) }
+                items(rows.value.filter { it.group == DiagRow.Group.CONNECTION }, key = { it.titleRes }) { row ->
+                    DiagRowView(row, onOpenGmsDiagnostics)
+                }
+                item { SectionTitle(res = R.string.diag_section_module) }
+                items(rows.value.filter { it.group == DiagRow.Group.MODULE }, key = { it.titleRes }) { row ->
+                    DiagRowView(row, onOpenGmsDiagnostics)
+                }
+                item {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = stringResource(R.string.diag_footer),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                }
             }
         }
     }
@@ -209,6 +230,10 @@ private fun buildRows(context: Context): List<DiagRow> {
     // is up). `Prefs.remote()` is set by MainActivity's service listener.
     val moduleBound = Prefs.remote() != null
 
+    // ---- Root-sourced signals (the diagnostics page runs in the app process;
+    // the hooker's "no su" red line applies to hook callbacks, not here). ----
+    val root = RootProbe.run()
+
     return listOf(
         DiagRow(
             R.string.diag_gms_installed,
@@ -240,6 +265,39 @@ private fun buildRows(context: Context): List<DiagRow> {
             if (gcmDiag) R.string.diag_gcm_diagnostics_ok else R.string.diag_gcm_diagnostics_bad,
             DiagRow.Group.GMS
         ),
+        // Root-only rows: the MCS socket, the greeze GMS gate, the alarm gate
+        // verdict. These are the questions the official screen answers in raw
+        // code; here they are one verdict each.
+        DiagRow(
+            R.string.diag_mcs_socket,
+            root.mcsEstablished,
+            when {
+                root.unavailable -> R.string.diag_root_unavailable
+                root.mcsEstablished -> R.string.diag_mcs_socket_ok
+                else -> R.string.diag_mcs_socket_bad
+            },
+            DiagRow.Group.CONNECTION
+        ),
+        DiagRow(
+            R.string.diag_greeze_gms,
+            root.gmsLimitOff,
+            when {
+                root.unavailable -> R.string.diag_root_unavailable
+                root.gmsLimitOff -> R.string.diag_greeze_ok
+                else -> R.string.diag_greeze_bad
+            },
+            DiagRow.Group.CONNECTION
+        ),
+        DiagRow(
+            R.string.diag_module_hook,
+            root.hookActive,
+            when {
+                root.unavailable -> R.string.diag_root_unavailable
+                root.hookActive -> R.string.diag_hook_ok
+                else -> R.string.diag_hook_bad
+            },
+            DiagRow.Group.MODULE
+        ),
         DiagRow(
             R.string.diag_module_bound,
             moduleBound,
@@ -254,6 +312,86 @@ private fun buildRows(context: Context): List<DiagRow> {
             action = DiagRow.Action.OPEN_GMS_DIAGNOSTICS
         )
     )
+}
+
+/**
+ * Root-shell reads for the diagnostics page. Everything here is read-only
+ * (`dumpsys`, `/proc`); nothing is written, nothing is killed — the hooker's
+ * red lines are about hook callbacks and behaviour changes, and this page
+ * only observes.
+ *
+ * One shell instance, four commands, run off the main thread by the caller
+ * (see [buildRows]'s call site). Every command that fails or times out marks
+ * its own signal unavailable — a root denial must not zero out the rest.
+ */
+private object RootProbe {
+
+    data class Result(
+        val unavailable: Boolean,
+        /** An established TCP socket owned by the GMS uid — the live MCS link. */
+        val mcsEstablished: Boolean,
+        /** `mGmsLimitEnabled` reads false on greezer — the ROM's GMS gate is off. */
+        val gmsLimitOff: Boolean,
+        /** The module's startup line is present in this boot's system log. */
+        val hookActive: Boolean
+    )
+
+    fun run(): Result {
+        val noRoot = Result(
+            unavailable = true, mcsEstablished = false, gmsLimitOff = false, hookActive = false
+        )
+        // libsu 6: the static entry points build/await the shell themselves.
+        // `rootAccess()` returns null while the grant dialog is still pending.
+        val granted = try {
+            com.topjohnwu.superuser.Shell.isAppGrantedRoot() == true ||
+                com.topjohnwu.superuser.Shell.rootAccess() == true
+        } catch (t: Throwable) {
+            false
+        }
+        if (!granted) {
+            return noRoot
+        }
+        try {
+            // 1. MCS socket: /proc/net/tcp is root-readable again under su.
+            //    GMS's uid comes from the package manager on the calling thread.
+            val uidOut = com.topjohnwu.superuser.Shell
+                .cmd("dumpsys package $GMS_PACKAGE | grep -m1 userId=").exec().out
+            val uid = uidOut.firstOrNull()
+                ?.substringAfter("userId=")?.trim()?.toIntOrNull()
+            var mcsEstablished = false
+            if (uid != null) {
+                val tcp = com.topjohnwu.superuser.Shell
+                    .cmd("cat /proc/net/tcp", "cat /proc/net/tcp6").exec().out
+                mcsEstablished = tcp.any { line ->
+                    val cols = line.trim().split(Regex("\\s+"))
+                    // st column: 01 = ESTABLISHED; uid column is 8th (index 7)
+                    cols.size > 7 && cols[3] == "01" && cols[7].toIntOrNull() == uid
+                }
+            }
+
+            // 2. The greeze GMS gate: `dumpsys greezer` prints mGmsLimitEnabled.
+            val greezer = com.topjohnwu.superuser.Shell
+                .cmd("dumpsys greezer").exec().out
+            val gmsLimitOff = greezer.any {
+                it.contains("mGmsLimitEnabled=false") || it.contains("mGmsLimitEnabled: false")
+            }
+
+            // 3. The module's own install summary proves the hook code is live
+            //    in this boot: the log buffer filtered to the module's tag.
+            val logs = com.topjohnwu.superuser.Shell
+                .cmd("logcat -d -s HyperGreeze -t 500").exec().out
+            val hookActive = logs.any { it.contains("hook(s) installed") }
+
+            return Result(
+                unavailable = false,
+                mcsEstablished = mcsEstablished,
+                gmsLimitOff = gmsLimitOff,
+                hookActive = hookActive
+            )
+        } catch (t: Throwable) {
+            return noRoot
+        }
+    }
 }
 
 private const val GMS_PACKAGE = "com.google.android.gms"

@@ -13,6 +13,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // libsu (root shell for the diagnostics page) publishes only here.
+        maven { url 'https://jitpack.io'; content { includeGroup 'com.github.topjohnwu.libsu' } }
         mavenLocal {
             content {
                 includeGroup("io.github.libxposed")
