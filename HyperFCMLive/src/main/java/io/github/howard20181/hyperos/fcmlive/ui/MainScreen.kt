@@ -3,15 +3,12 @@ package io.github.howard20181.hyperos.fcmlive.ui
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import android.view.HapticFeedbackConstants
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -63,9 +60,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TooltipAnchorPosition
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
-import androidx.compose.material3.pulltorefresh.PullToRefreshState
-import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -73,9 +67,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.distinctUntilChanged
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -85,7 +76,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -161,14 +151,11 @@ data class MainActions(
 )
 
 /**
- * The whole page: bar, list and pull-to-refresh.
+ * The whole page: bar, list and the refresh hairline.
  *
- * Hosting it as one composition is what lets the refresh be the bare spinner
- * [RefreshIndicator] draws instead of the stock M3 Expressive plate-and-morph
- * indicator. `PullToRefreshBox` is a Compose gesture that reports its own
- * progress, so none of the old View-shell machinery survives here — and
- * neither does the View that had to ask a `LazyListState` whether the list was
- * already scrolled, because the nested-scroll handshake answers that by itself.
+ * The list scan is a background task the screen surfaces as a 2dp line
+ * sweeping the top edge ([RefreshLine]); onResume rescans, so the common
+ * path never needs a gesture at all.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -196,8 +183,6 @@ fun MainScreen(
     // messages originate; hosted here, because this is the tree on screen.
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() }
 ) {
-    val pullState = rememberPullToRefreshState()
-
     // A finished refresh puts the list back at the top.
     //
     // The scan re-sorts: checked apps first, everything else alphabetically. A
@@ -239,31 +224,82 @@ fun MainScreen(
             )
         }
     ) { innerPadding ->
-        PullToRefreshBox(
-            isRefreshing = refreshing,
-            onRefresh = onRefresh,
-            state = pullState,
+        Box(
             modifier = Modifier
-                // Only the top edge is a hard stop — the bar above owns it.
-                // The bottom edge scrolls: the navigation-bar / FAB room goes
-                // into the list's `contentPadding` instead of this padding, so
-                // rows pass under the gesture hint line while scrolling and
-                // nothing paints a dead background band at the screen edge.
                 .padding(top = innerPadding.calculateTopPadding())
-                .fillMaxSize(),
-            indicator = { RefreshIndicator(pullState, refreshing) },
-            content = {
-                AppListPane(
-                    apps = apps,
-                    multiSelect = multiSelect,
-                    selected = selected,
-                    lazyListState = lazyListState,
-                    onRowClick = onRowClick,
-                    onRowLongClick = onRowLongClick,
-                    loadIcon = loadIcon,
-                    bottomPadding = innerPadding.calculateBottomPadding() + LIST_BOTTOM_PAD
-                )
-            }
+                .fillMaxSize()
+        ) {
+            AppListPane(
+                apps = apps,
+                multiSelect = multiSelect,
+                selected = selected,
+                lazyListState = lazyListState,
+                onRowClick = onRowClick,
+                onRowLongClick = onRowLongClick,
+                loadIcon = loadIcon,
+                bottomPadding = innerPadding.calculateBottomPadding() + LIST_BOTTOM_PAD
+            )
+            // The whole refresh affordance: a hairline scanning the top edge.
+            // The ring is gone — the scan it stood for is a silent background
+            // task, and a line that sweeps while it runs is the smallest honest
+            // sign of that. Indeterminate by design: the scan has no meaningful
+            // progress to report, only "running" vs "done".
+            RefreshLine(visible = refreshing, modifier = Modifier.align(Alignment.TopCenter))
+        }
+    }
+}
+
+/**
+ * The refresh affordance: a 2dp hairline at the very top of the list, sweeping
+ * left↔right for as long as the scan runs.
+ *
+ * Indeterminate on purpose. A ring implied "pull to refresh" as a first-class
+ * gesture; the gesture is now a fallback (onResume rescans automatically, so
+ * the common path never needs it), and the only honest claim this screen makes
+ * while scanning is "a scan is running" — no progress, no completion circle,
+ * no bounce. The line appears by fading in, sweeps on an infinite transition,
+ * and fades out when the scan ends; everything reads inside the draw scope, so
+ * the sweep costs draw passes only.
+ */
+@Composable
+private fun RefreshLine(visible: Boolean, modifier: Modifier = Modifier) {
+    val lineColor = MaterialTheme.colorScheme.primary
+    // One animated phase drives the sweep; alpha is derived from `visible`
+    // with animateFloatAsState so enter/exit get the same motion language as
+    // every other fade on this screen.
+    val sweep = rememberInfiniteTransition(label = "refresh-line")
+    val phase = sweep.animateFloat(
+        initialValue = -1f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "refresh-line-phase"
+    )
+    val alpha = animateFloatAsState(
+        targetValue = if (visible) 1f else 0f,
+        animationSpec = tween(durationMillis = 200),
+        label = "refresh-line-alpha"
+    )
+    Canvas(modifier = modifier.fillMaxWidth().height(REFRESH_LINE_THICKNESS)) {
+        if (alpha.value <= 0.01f) {
+            return@Canvas
+        }
+        // The head is a short segment travelling across the full width, with a
+        // short tail behind it — a scan, not a progress bar with a fraction.
+        val w = size.width
+        val head = (phase.value + 1f) / 2f
+        val segment = w * 0.22f
+        val end = w * head
+        val start = (end - segment).coerceAtLeast(0f)
+        drawLine(
+            color = lineColor,
+            start = Offset(start, size.height / 2f),
+            end = Offset(end, size.height / 2f),
+            strokeWidth = size.height,
+            alpha = alpha.value,
+            cap = StrokeCap.Round
         )
     }
 }
@@ -272,170 +308,11 @@ fun MainScreen(
  * Room the last card keeps between itself and the navigation-bar inset. The FAB
  * is gone (diagnostics lives in the overflow menu now), so this is one gap only.
  */
+/** Thickness of the top refresh hairline. */
+private val REFRESH_LINE_THICKNESS = 2.dp
+
 private val LIST_BOTTOM_PAD = 16.dp
 
-/**
- * The pull-to-refresh feedback: a thin stroke-only arc, no container, springy
- * on release.
- *
- * The stock [PullToRefreshDefaults.LoadingIndicator] is the M3 Expressive
- * box-in-box indicator: a filled circular plate that grows with the pull and
- * keeps morphing while it spins. On this page the plate read as a heavy blob
- * pinned to the top of the list — the user asked for the classic behaviour
- * instead: pull, a bare spinner follows the finger, release, the arc bounces
- * back with a spring overshoot and then just spins until the refresh
- * completes. Nothing else.
- *
- * ## Why two streams, and why the spring starts once
- *
- * The first revision lost exactly one frame of every spring: the snapshotFlow
- * carried the continuously-changing fraction, so the frame's own retract
- * animation re-emitted every frame and `collectLatest` re-launched the spring
- * every frame — which zeroes its velocity each time. The tail crawled instead
- * of settled, and the release read as sticky. The split below fixes that by
- * what each stream is allowed to carry:
- *
- * - Leg 1 carries **only booleans** (`isAnimating`, `isRefreshing`). Each
- *   discrete transition — release, refresh committed, refresh finished —
- *   launches exactly one spring that runs to completion untouched.
- * - Leg 2 carries the live fraction and only acts while the finger is down:
- *   `snapTo` mirrors it 1:1, and because `Animatable.snapTo` cancels a running
- *   animation, grabbing the ring mid-bounce hands control back seamlessly.
- *   The `fraction > 0` guard keeps the idle stream from killing the settle
- *   spring after the refresh completes.
- *
- * Every animated read ([Animatable.value], the spin angle) happens inside the
- * draw scope, so a running spring re-runs the draw phase only — the
- * composition is never re-executed per frame. Overshoot below zero (the
- * spring swinging past rest) is not clamped away: it maps to a slight fade
- * with the ring already on its way back, which reads as the flex the bounce
- * is made of instead of a vanishing act.
- */
-@Composable
-private fun RefreshIndicator(state: PullToRefreshState, isRefreshing: Boolean) {
-    val strokeColor = MaterialTheme.colorScheme.onSurfaceVariant
-    val rendered = remember { Animatable(0f) }
-    val releaseSpec = remember {
-        spring<Float>(
-            // A touch bouncier than MediumBouncy (0.5): the user asked for a
-            // clearly visible Q on release, and 0.45 overshoots ~35% more
-            // while still settling in one bounce.
-            dampingRatio = 0.45f,
-            stiffness = 350f,
-            // Stop the spring while the tail is still visible; the default
-            // 0.01 threshold let it crawl in sub-pixel steps for a few frames.
-            visibilityThreshold = 0.0025f
-        )
-    }
-
-    // Leg 1: discrete transitions, one spring each. See the class doc.
-    LaunchedEffect(state, isRefreshing) {
-        snapshotFlow { Pair(state.isAnimating, isRefreshing) }
-            .distinctUntilChanged()
-            .collectLatest { (animating, refreshing) ->
-                when {
-                    // Refresh committed: spring up to full and hold, spinning.
-                    refreshing -> rendered.animateTo(1f, releaseSpec)
-                    // Release below threshold, or the refresh just finished:
-                    // spring back to rest from wherever the ring is. One run,
-                    // no relaunches.
-                    else -> rendered.animateTo(0f, releaseSpec)
-                }
-            }
-    }
-
-    // Leg 2: the live gesture. See the class doc.
-    LaunchedEffect(state, isRefreshing) {
-        snapshotFlow { state.distanceFraction }
-            .collectLatest { fraction ->
-                if (!state.isAnimating && !isRefreshing && fraction > 0f) {
-                    rendered.snapTo(fraction)
-                }
-            }
-    }
-
-    val spin = rememberInfiniteTransition(label = "refresh-spin")
-    val spinAngle = spin.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 800, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "refresh-spin-angle"
-    )
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(SPINNER_SLOT)
-            .clipToTop(),
-        contentAlignment = Alignment.TopCenter
-    ) {
-        // The canvas stays composed unconditionally; every animated value is
-        // read inside the draw scope, so the running spring costs draw passes
-        // only.
-        Canvas(
-            modifier = Modifier
-                .padding(top = SPINNER_DROP)
-                .size(SPINNER_DIAMETER)
-        ) {
-            val v = rendered.value
-            if (v <= 0f && !isRefreshing) {
-                return@Canvas
-            }
-            val mag = v.coerceIn(0f, 1f)
-            val over = (v - 1f).coerceAtLeast(0f)
-            val under = (-v).coerceAtLeast(0f)
-            val alpha = (1f - under * 2.5f).coerceIn(0f, 1f)
-            // The ring is alive from the first pixel of the pull: the arc
-            // rotates even while the finger is down. A static arc read as the
-            // animation freezing mid-play ("played half and stopped") whenever
-            // the pull paused; rotation on every phase is what makes it read
-            // as a spinning ring. The sweep still grows with the pull, and
-            // once the refresh commits the arc stays full and just rotates.
-            val spinning = isRefreshing || v >= 0.999f
-            val sweep = 90f + 180f * mag
-            val baseAngle = spinAngle.value - 90f
-            // Pull phase: the arc's trailing edge also retreats with the
-            // rotation so the arc reads as chasing its own tail — the classic
-            // indeterminate feel. At full pull / refreshing, 270° sweep
-            // rotating around the centre.
-            val start = baseAngle
-            // Overshoot above 1 (release at full pull) breathes the ring
-            // wider; the fade above is the mirror for the undershoot.
-            val grow = 1f + over * 0.35f
-            translate(top = SPINNER_TRAVEL.toPx() * mag) {
-                drawArc(
-                    color = strokeColor,
-                    startAngle = start,
-                    sweepAngle = sweep,
-                    useCenter = false,
-                    alpha = alpha,
-                    style = Stroke(
-                        width = SPINNER_STROKE.toPx() * grow,
-                        cap = StrokeCap.Round
-                    )
-                )
-            }
-        }
-    }
-}
-
-/** Slot height the spinner lives in; also the clip window for the pull. */
-private val SPINNER_SLOT = 56.dp
-
-/** The spinner's rest position below the top edge. */
-private val SPINNER_DROP = 12.dp
-
-/** Vertical travel the bounce rides on: how far the pull slides the ring down. */
-private val SPINNER_TRAVEL = 10.dp
-
-private val SPINNER_DIAMETER = 32.dp
-
-private val SPINNER_STROKE = 2.5.dp
-
-/** Clips drawing above the slot's top edge, so the pull slides out from under the bar. */
-private fun Modifier.clipToTop(): Modifier = clip(RectangleShape)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
