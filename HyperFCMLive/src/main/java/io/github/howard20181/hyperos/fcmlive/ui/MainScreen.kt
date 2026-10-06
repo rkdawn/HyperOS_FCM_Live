@@ -3,11 +3,15 @@ package io.github.howard20181.hyperos.fcmlive.ui
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import android.view.HapticFeedbackConstants
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -267,41 +271,75 @@ fun MainScreen(
 private val LIST_BOTTOM_PAD = 16.dp
 
 /**
- * The pull-to-refresh feedback: a thin stroke-only arc, no container.
+ * The pull-to-refresh feedback: a thin stroke-only arc, no container, springy
+ * on release.
  *
  * The stock [PullToRefreshDefaults.LoadingIndicator] is the M3 Expressive
  * box-in-box indicator: a filled circular plate that grows with the pull and
  * keeps morphing while it spins. On this page the plate read as a heavy blob
  * pinned to the top of the list — the user asked for the classic behaviour
- * instead: pull, a bare spinner follows the finger, release, the list snaps
- * back and the arc just spins until the refresh completes. Nothing else.
+ * instead: pull, a bare spinner follows the finger, release, the arc bounces
+ * back with a spring overshoot and then just spins until the refresh
+ * completes. Nothing else.
  *
- * So this draws exactly that. The geometry is driven entirely by
- * [PullToRefreshState.distanceFraction]:
+ * Ownership of the rendered value:
  *
- * - 0 .. 1 (the pull): the arc grows from 0° up to 270° and fades in from
- *   nothing, tracking the finger. Its centre rides down with the same
- *   fraction, inside a fixed-height slot that clips at the top edge — the
- *   spinner appears to slide out from under the top bar.
- * - > 1 or [isRefreshing] (committed): the arc holds 270° and sweeps around
- *   forever — the one spinning circle the user asked for.
+ * - Finger down (`gestureActive`: the frame reports a live gesture, no
+ *   internal animation running, refresh not pending): `rendered` mirrors
+ *   [PullToRefreshState.distanceFraction] directly — 1:1 with the finger.
+ * - The moment the gesture ends, a [spring] takes over from the last mirrored
+ *   value: bouncy (medium damping) so the return to 0 visibly overshoots and
+ *   settles — the Q-bounce. The frame's own linear `animateToHidden` runs in
+ *   parallel but is ignored: its value is only ever read while the finger is
+ *   down.
+ * - Refresh pending: the spring pulls `rendered` to 1 and the arc sweeps
+ *   forever; when the refresh completes the same spring hands it back down.
  *
- * Everything (position, arc length, alpha) is a function of the fraction and
- * one time source; there is no state machine and no animation to desync. The
- * slot is [SPINNER_SLOT] tall so the clip window does not change with the
- * pull, and the spinner's own diameter [SPINNER_DIAMETER] is small enough to
- * pass under the status-bar inset without touching the list's first card.
- *
- * `pullState.distanceFraction` is a plain float state read inside the draw
- * scope, so every frame of the pull recomposes nothing — only the draw phase
- * re-runs. The spin uses `rememberInfiniteTransition` for the same reason: one
- * float, one draw.
+ * The spring spec is the same family every other transition on this screen
+ * gets from [androidx.compose.material3.MotionScheme.expressive], so the
+ * bounce reads as part of the app's motion language rather than a bespoke
+ * curve.
  */
 @Composable
 private fun RefreshIndicator(state: PullToRefreshState, isRefreshing: Boolean) {
-    val fraction = state.distanceFraction
-    val spinning = isRefreshing || fraction > 1f
+    val frameFraction = state.distanceFraction
+    val gestureActive = !isRefreshing && !state.isAnimating && frameFraction > 0.01f
     val strokeColor = MaterialTheme.colorScheme.onSurfaceVariant
+
+    var rendered by remember { mutableStateOf(0f) }
+    if (gestureActive) {
+        // Finger down: mirror the frame 1:1. A plain write, not an animation —
+        // the finger is the animator.
+        rendered = frameFraction
+    }
+    val springSpec: AnimationSpec<Float> = remember {
+        spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMediumLow
+        )
+    }
+    LaunchedEffect(gestureActive, isRefreshing) {
+        when {
+            gestureActive -> Unit // mirroring above owns the value
+            isRefreshing -> {
+                // Pull up to full and hold there while the refresh runs.
+                val anim = Animatable(rendered.coerceIn(0f, 1f))
+                anim.animateTo(1f, springSpec)
+                rendered = 1f
+            }
+            rendered > 0.01f -> {
+                // Released (or refresh finished): bounce to rest from wherever
+                // the value is now. The spring's overshoot below zero is clamped
+                // out at draw time, so the ring visibly bounces and fades.
+                val anim = Animatable(rendered.coerceIn(0f, 1f))
+                anim.animateTo(0f, springSpec)
+                rendered = anim.value
+            }
+            else -> rendered = 0f
+        }
+    }
+    val shown = rendered.coerceIn(0f, 1.2f)
+    val spinning = isRefreshing || frameFraction > 1f
     val spin = rememberInfiniteTransition(label = "refresh-spin")
     val spinAngle by spin.animateFloat(
         initialValue = 0f,
@@ -319,21 +357,22 @@ private fun RefreshIndicator(state: PullToRefreshState, isRefreshing: Boolean) {
             .clipToTop(),
         contentAlignment = Alignment.TopCenter
     ) {
-        if (fraction > 0.01f || isRefreshing) {
+        if (shown > 0.01f || isRefreshing) {
             Canvas(
                 modifier = Modifier
                     .padding(top = SPINNER_DROP)
                     .size(SPINNER_DIAMETER)
             ) {
-                // Pull phase: 0..1 drives both how much of the circle is drawn
-                // (a quarter arc up to three quarters) and how visible it is.
-                // Committed phase: full 270° sweep, fully opaque, rotating.
-                val pull = fraction.coerceIn(0f, 1f)
-                val alpha = if (isRefreshing) 1f else pull
+                val pull = shown.coerceIn(0f, 1f)
+                val alpha = pull.coerceIn(0f, 1f)
+                // Pull phase: the arc grows with the finger. Spin phase: full
+                // 270° sweep rotating. The spring overshoot past 1 widens the
+                // stroke slightly, which reads as the ring flexing on release.
+                val overshoot = (shown - 1f).coerceAtLeast(0f)
                 val sweep = if (spinning) 270f else 45f + 270f * pull
                 val start = if (spinning) spinAngle - 90f else -90f
                 val stroke = Stroke(
-                    width = SPINNER_STROKE.toPx(),
+                    width = SPINNER_STROKE.toPx() * (1f + overshoot * 0.25f),
                     cap = StrokeCap.Round
                 )
                 drawArc(
@@ -677,9 +716,6 @@ private fun OverflowMenu(state: OverflowState, actions: MainActions) {
                 label = stringResource(R.string.fcm_diagnostics),
                 modifier = Modifier.fillMaxWidth(),
                 minWidth = MENU_OVERFLOW_MIN_WIDTH,
-                leading = {
-                    RowIcon(painter = painterResource(R.drawable.ic_fcm_diagnostics))
-                },
                 onClick = { expanded = false; actions.onDiagnostics() }
             )
             Spacer(modifier = Modifier.height(MENU_ITEM_GAP))
