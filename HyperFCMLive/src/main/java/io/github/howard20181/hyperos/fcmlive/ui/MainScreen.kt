@@ -387,9 +387,20 @@ private fun RefreshIndicator(state: PullToRefreshState, isRefreshing: Boolean) {
             val over = (v - 1f).coerceAtLeast(0f)
             val under = (-v).coerceAtLeast(0f)
             val alpha = (1f - under * 2.5f).coerceIn(0f, 1f)
+            // The ring is alive from the first pixel of the pull: the arc
+            // rotates even while the finger is down. A static arc read as the
+            // animation freezing mid-play ("played half and stopped") whenever
+            // the pull paused; rotation on every phase is what makes it read
+            // as a spinning ring. The sweep still grows with the pull, and
+            // once the refresh commits the arc stays full and just rotates.
             val spinning = isRefreshing || v >= 0.999f
-            val sweep = if (spinning) 270f else 45f + 270f * mag
-            val start = if (spinning) spinAngle.value - 90f else -90f
+            val sweep = 90f + 180f * mag
+            val baseAngle = spinAngle.value - 90f
+            // Pull phase: the arc's trailing edge also retreats with the
+            // rotation so the arc reads as chasing its own tail — the classic
+            // indeterminate feel. At full pull / refreshing, 270° sweep
+            // rotating around the centre.
+            val start = baseAngle
             // Overshoot above 1 (release at full pull) breathes the ring
             // wider; the fade above is the mirror for the undershoot.
             val grow = 1f + over * 0.35f
