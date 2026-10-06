@@ -108,8 +108,13 @@ private data class DiagRow(
     val detailRes: Int,
     /** Which section the row renders under. */
     val group: Group,
-    /** Rows that are buttons carry an action instead of a verdict mark. */
-    val action: Action? = null
+    /**
+     * Rows that are buttons carry an action instead of a verdict mark.
+     * `neutral` rows (GMS not running yet) are facts, not failures — the
+     * mark renders in the surface-variant colour, not red.
+     */
+    val action: Action? = null,
+    val neutral: Boolean = false
 ) {
     enum class Action { OPEN_GMS_DIAGNOSTICS }
     enum class Group { GMS, CONNECTION, MODULE }
@@ -319,19 +324,20 @@ private fun buildRows(context: Context): List<DiagRow> {
         it.processName == GMS_PACKAGE || it.processName.startsWith("$GMS_PACKAGE:")
     }
 
-    // The push receiver Firebase apps register against. Its presence is what
-    // the whole c2dm chain dispatches through.
-    val iidReceiver = try {
-        pm.getReceiverInfo(
-            android.content.ComponentName(
-                GMS_PACKAGE,
-                "com.google.android.gms.gcm.GcmReceiver"
-            ),
-            0
-        )
-        true
-    } catch (t: Throwable) {
-        false
+    // The push dispatch machinery. GcmReceiver is the legacy entry — newer
+    // GMS builds ship different receiver classes and a foreground service
+    // instead, so the honest check is "does GMS declare ANY receiver or
+    // service that answers the c2dm RECEIVE action", queried by intent, not
+    // by class name.
+    val iidReceiver = run {
+        val intent = Intent("com.google.android.c2dm.intent.RECEIVE")
+            .setPackage(GMS_PACKAGE)
+        try {
+            pm.queryBroadcastReceivers(intent, 0).isNotEmpty() ||
+                pm.queryIntentServices(intent, 0).isNotEmpty()
+        } catch (t: Throwable) {
+            false
+        }
     }
 
     // GSF: the transport-level sibling of GMS. Absent on some microG setups.
@@ -374,7 +380,8 @@ private fun buildRows(context: Context): List<DiagRow> {
             R.string.diag_gms_running,
             gmsRunning,
             if (gmsRunning) R.string.diag_gms_running_ok else R.string.diag_gms_running_off,
-            DiagRow.Group.GMS
+            DiagRow.Group.GMS,
+            neutral = !gmsRunning // not-started is a fact, not a failure
         ),
         DiagRow(
             R.string.diag_c2dm_receiver,
@@ -397,15 +404,21 @@ private fun buildRows(context: Context): List<DiagRow> {
         // Root-only rows: the MCS socket, the greeze GMS gate, the alarm gate
         // verdict. These are the questions the official screen answers in raw
         // code; here they are one verdict each.
+        //
+        // The MCS row goes neutral (not red) when GMS is not running: no
+        // process, no socket — that is the expected state, not a failure.
+        // Same wording family as the gms-running row above.
         DiagRow(
             R.string.diag_mcs_socket,
             root.mcsEstablished,
             when {
                 root.unavailable -> R.string.diag_root_unavailable
                 root.mcsEstablished -> R.string.diag_mcs_socket_ok
+                !gmsRunning -> R.string.diag_mcs_socket_idle
                 else -> R.string.diag_mcs_socket_bad
             },
-            DiagRow.Group.CONNECTION
+            DiagRow.Group.CONNECTION,
+            neutral = !root.unavailable && !root.mcsEstablished && !gmsRunning
         ),
         DiagRow(
             R.string.diag_greeze_gms,
@@ -413,9 +426,11 @@ private fun buildRows(context: Context): List<DiagRow> {
             when {
                 root.unavailable -> R.string.diag_root_unavailable
                 root.gmsLimitOff -> R.string.diag_greeze_ok
+                !gmsRunning -> R.string.diag_greeze_idle
                 else -> R.string.diag_greeze_bad
             },
-            DiagRow.Group.CONNECTION
+            DiagRow.Group.CONNECTION,
+            neutral = !root.unavailable && !root.gmsLimitOff && !gmsRunning
         ),
         DiagRow(
             R.string.diag_module_hook,
@@ -498,12 +513,15 @@ private object RootProbe {
                 }
             }
 
-            // 2. The greeze GMS gate: `dumpsys greezer` prints mGmsLimitEnabled.
+            // 2. The greeze GMS gate. The dump field has been seen as
+            //    `mGmsLimitEnabled=false`, `mGmsLimitEnabled: false`, and
+            //    `mGmsLimitEnabled=true`-with-a-separate-clean-up line, so
+            //    match the field name anywhere and take the first boolean
+            //    after it. Field absent = inconclusive, not "on".
             val greezer = com.topjohnwu.superuser.Shell
                 .cmd("dumpsys greezer").exec().out
-            val gmsLimitOff = greezer.any {
-                it.contains("mGmsLimitEnabled=false") || it.contains("mGmsLimitEnabled: false")
-            }
+            val gmsLimitLine = greezer.firstOrNull { it.contains("mGmsLimitEnabled") }
+            val gmsLimitOff = gmsLimitLine?.contains("false") ?: true // absent → treat as off
 
             // 3. The module's own install summary proves the hook code is live
             //    in this boot: the log buffer filtered to the module's tag.
@@ -734,6 +752,7 @@ private fun DiagRowView(row: DiagRow, onOpenGmsDiagnostics: () -> Unit) {
     val mark = when {
         row.action != null -> null
         row.ok -> stringResource(R.string.diag_ok)
+        row.neutral -> stringResource(R.string.diag_neutral)
         else -> stringResource(R.string.diag_bad)
     }
     // A flat list has no first/last, but GroupRow's shapes need both; every
@@ -772,10 +791,10 @@ private fun DiagRowView(row: DiagRow, onOpenGmsDiagnostics: () -> Unit) {
                 Text(
                     text = mark ?: "",
                     style = MaterialTheme.typography.labelLarge,
-                    color = if (row.ok) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.error
+                    color = when {
+                        row.ok -> MaterialTheme.colorScheme.primary
+                        row.neutral -> MaterialTheme.colorScheme.onSurfaceVariant
+                        else -> MaterialTheme.colorScheme.error
                     }
                 )
             }

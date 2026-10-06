@@ -173,6 +173,9 @@
     <string name="diag_open_gcm_detail">查看 MCS 长连接、心跳与各应用的推送注册明细</string>
     <string name="diag_ok">正常</string>
     <string name="diag_bad">异常</string>
+    <string name="diag_neutral">待运行</string>
+    <string name="diag_mcs_socket_idle">GMS 进程未运行——收到下一条推送时它会自动拉起并重连</string>
+    <string name="diag_greeze_idle">GMS 进程未运行，闸门状态待其启动后再看</string>
     <string name="diag_open">打开</string>
     <string name="diag_footer">以上是本机能读到的全部状态。长连接是否被系统掐断、广播是否被拦的完整链路，请看 LSPosed 日志中 HyperGreeze 标签的输出。</string>
     <string name="shortcut_settings">设置</string>
