@@ -67,6 +67,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshState
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -202,20 +203,28 @@ fun MainScreen(
     // finger and the scan are done, the same spring returns it to 0 — the
     // "检测完再弹回去" the user asked for.
     //
-    // The value is consumed by a graphicsLayer below (draw-phase translation),
-    // NOT by a Spacer's height: a height change re-measures and re-lays-out
-    // the whole list every frame — the jank the previous revision had. A
-    // translation only re-runs the draw pass, which is how the stock
-    // PullToRefreshBox moves its content (its own Animatable runs at
-    // default spring: dampingRatio 1, stiffness 1500 — the reference feel).
-    // The spring specs below were aligned to that: critically damped, no
-    // overshoot, settle fast.
-    val frameFraction = pullState.distanceFraction
-    val gestureOwns = !refreshing && !pullState.isAnimating && frameFraction > 0f
-    var gesture by remember { mutableStateOf(0f) }
+    // Frame-economy contract (the second jank fix): the fraction States are
+    // READ ONLY INSIDE the graphicsLayer lambda below. A graphicsLayer block
+    // is a draw-phase observer — reading a State there subscribes the layer
+    // to it without invalidating composition, so a finger moving at 120 Hz
+    // re-runs the layer update and nothing else. The previous revision
+    // computed `gapFraction` in composition scope, which made every gesture
+    // frame a full MainScreen recompose — Scaffold, topBar, the
+    // PullToRefreshBox lambda, all of it. That was the residual jank.
+    // `refreshing` still drives composition (the line's visibility toggles),
+    // but it flips once per scan, not per frame.
+    val gestureFraction = remember { mutableStateOf(0f) }
     val gapSpring = remember { Animatable(0f) }
-    if (gestureOwns && gesture != frameFraction) {
-        gesture = frameFraction
+    val gestureOwns by remember {
+        derivedStateOf {
+            !refreshing && !pullState.isAnimating && pullState.distanceFraction > 0f
+        }
+    }
+    // Finger tracking stays a composition write (the finger is the animator);
+    // derivedStateOf keeps the recomposition it triggers scoped to the
+    // observers that actually read `gestureOwns`, not the whole screen.
+    if (gestureOwns && gestureFraction.value != pullState.distanceFraction) {
+        gestureFraction.value = pullState.distanceFraction
     }
     // One sequencer owns the whole lifecycle, in order. The close leg waits
     // 380ms before pulling the gap down — exactly the duration of the line's
@@ -242,14 +251,14 @@ fun MainScreen(
                 // stiffness 1500) — same curve the framework uses for its
                 // own indicator, and the one that does not read as dropped
                 // frames.
-                val start = maxOf(gesture, gapSpring.value, if (gestureOwns) frameFraction else 0f)
+                val start = maxOf(gestureFraction.value, gapSpring.value)
                 gapSpring.snapTo(start.coerceIn(0f, 1f))
                 gapSpring.animateTo(1f)
             }
             else -> {
                 // Finger lifted, no scan: close. Also the scan-just-ended leg —
                 // both arrive here, and both close the gap the same way.
-                val releasePoint = maxOf(gesture, gapSpring.value)
+                val releasePoint = maxOf(gestureFraction.value, gapSpring.value)
                 if (releasePoint > 0.01f && !gapSpring.isRunning) {
                     gapSpring.snapTo(releasePoint.coerceIn(0f, 1f))
                     // Let the line's zip+fade (300+240ms, overlapping) finish
@@ -259,11 +268,10 @@ fun MainScreen(
                     }
                     gapSpring.animateTo(0f)
                 }
-                gesture = 0f
+                gestureFraction.value = 0f
             }
         }
     }
-    val gapFraction = if (gestureOwns) gesture else gapSpring.value
 
     // A finished refresh puts the list back at the top.
     //
@@ -339,7 +347,17 @@ fun MainScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer {
-                            val gapPx = (GAP_REST + GAP_TRAVEL * gapFraction).toPx()
+                            // Read the fraction States HERE, not in composition:
+                            // a graphicsLayer block re-runs its update when the
+                            // States it reads change, without invalidating
+                            // composition — the whole point of the frame-economy
+                            // contract above.
+                            val f = if (gestureOwns) {
+                                gestureFraction.value
+                            } else {
+                                gapSpring.value
+                            }
+                            val gapPx = (GAP_REST + GAP_TRAVEL * f).toPx()
                             translationY = gapPx - (GAP_REST + GAP_TRAVEL).toPx()
                         }
                 ) {
