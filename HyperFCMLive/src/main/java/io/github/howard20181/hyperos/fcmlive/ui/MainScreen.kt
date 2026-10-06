@@ -3,6 +3,8 @@ package io.github.howard20181.hyperos.fcmlive.ui
 import android.content.res.Configuration
 import android.graphics.drawable.Drawable
 import android.view.HapticFeedbackConstants
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -264,9 +266,6 @@ fun MainScreen(
 @Composable
 private fun RefreshLine(visible: Boolean, modifier: Modifier = Modifier) {
     val lineColor = MaterialTheme.colorScheme.primary
-    // One animated phase drives the sweep; alpha is derived from `visible`
-    // with animateFloatAsState so enter/exit get the same motion language as
-    // every other fade on this screen.
     val sweep = rememberInfiniteTransition(label = "refresh-line")
     val phase = sweep.animateFloat(
         initialValue = -1f,
@@ -277,40 +276,74 @@ private fun RefreshLine(visible: Boolean, modifier: Modifier = Modifier) {
         ),
         label = "refresh-line-phase"
     )
-    val alpha = animateFloatAsState(
-        targetValue = if (visible) 1f else 0f,
-        animationSpec = tween(durationMillis = 200),
-        label = "refresh-line-alpha"
-    )
+    val alpha = remember { Animatable(0f) }
+    // The completion leg. 0 = the segment where the sweep left it; 1 = the
+    // line closed into one full-width stroke. Frozen start/end are captured
+    // the moment the scan ends, so the close-up begins where the eye last
+    // saw the segment instead of jumping to an edge.
+    val completion = remember { Animatable(1f) }
+    var doneStart by remember { mutableStateOf(0f) }
+    var doneEnd by remember { mutableStateOf(1f) }
+
+    LaunchedEffect(visible) {
+        if (visible) {
+            // A new scan: reset the close-up and ride the fade in.
+            completion.snapTo(0f)
+            alpha.animateTo(1f, tween(durationMillis = 200))
+        } else if (alpha.value > 0.01f) {
+            // Scan finished. The segment zips open into a full-width line —
+            // tail runs to the left edge, head to the right — and the whole
+            // stroke fades. One decisive "done", the Chrome progress-bar
+            // completion read, instead of the sweep just evaporating.
+            val head = (phase.value + 1f) / 2f
+            doneStart = (head - REFRESH_LINE_SEGMENT).coerceAtLeast(0f)
+            doneEnd = head.coerceAtLeast(doneStart)
+            completion.snapTo(0f)
+            completion.animateTo(
+                1f,
+                tween(durationMillis = 300, easing = FastOutSlowInEasing)
+            )
+            alpha.animateTo(0f, tween(durationMillis = 240))
+        }
+    }
+
     Canvas(modifier = modifier.fillMaxWidth().height(REFRESH_LINE_THICKNESS)) {
-        if (alpha.value <= 0.01f) {
+        val a = alpha.value
+        if (a <= 0.01f) {
             return@Canvas
         }
-        // The head is a short segment travelling across the full width, with a
-        // short tail behind it — a scan, not a progress bar with a fraction.
         val w = size.width
-        val head = (phase.value + 1f) / 2f
-        val segment = w * 0.22f
-        val end = w * head
-        val start = (end - segment).coerceAtLeast(0f)
+        val startF: Float
+        val endF: Float
+        if (!visible) {
+            // Done leg: interpolate the frozen segment out to full width.
+            val c = completion.value
+            startF = doneStart + (0f - doneStart) * c
+            endF = doneEnd + (1f - doneEnd) * c
+        } else {
+            // Sweeping: short segment travelling the width, tail behind.
+            val head = (phase.value + 1f) / 2f
+            endF = head
+            startF = (head - REFRESH_LINE_SEGMENT).coerceAtLeast(0f)
+        }
         drawLine(
             color = lineColor,
-            start = Offset(start, size.height / 2f),
-            end = Offset(end, size.height / 2f),
+            start = Offset(startF * w, size.height / 2f),
+            end = Offset(endF * w, size.height / 2f),
             strokeWidth = size.height,
-            alpha = alpha.value,
+            alpha = a,
             cap = StrokeCap.Round
         )
     }
 }
 
-/**
- * Room the last card keeps between itself and the navigation-bar inset. The FAB
- * is gone (diagnostics lives in the overflow menu now), so this is one gap only.
- */
 /** Thickness of the top refresh hairline. */
 private val REFRESH_LINE_THICKNESS = 2.dp
 
+/** Sweeping segment length as a fraction of the line's width. */
+private const val REFRESH_LINE_SEGMENT = 0.22f
+
+/** Bottom padding the last list card keeps above the navigation-bar inset. */
 private val LIST_BOTTOM_PAD = 16.dp
 
 
