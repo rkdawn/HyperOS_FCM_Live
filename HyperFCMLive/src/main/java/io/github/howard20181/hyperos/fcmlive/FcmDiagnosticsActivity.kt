@@ -120,12 +120,17 @@ internal data class LogRead(val lines: List<ModuleLogParser.Line>, val ok: Boole
 internal enum class Verdict(val label: String) { OK("已确认"), INFO("说明"), UNKNOWN("未知"), ATTENTION("需检查") }
 internal data class DiagnosticItem(val id: String, val title: String, val detail: String, val verdict: Verdict)
 private data class FcmApp(val pkg: String, val label: String, val declared: Boolean)
-private data class BasicDiagnostics(val installed: Boolean?, val apps: List<FcmApp>, val warning: String)
+private data class BasicDiagnostics(val installed: Boolean?, val apps: List<FcmApp>, val warning: String,
+    val strictMode: Boolean = false, val allowlist: Set<String> = emptySet())
 
 private fun basicDiagnostics(context: Context): BasicDiagnostics {
     val pm = context.packageManager
     val installed = try { pm.getApplicationInfo(DiagnosticsParser.GMS, 0); true }
         catch (_: PackageManager.NameNotFoundException) { false } catch (_: Exception) { null }
+    // 严格模式与勾选名单用于解释"没有放行记录"：严格模式下未勾选的应用
+    // 门控本来就不插手，这不是"没收到推送"。
+    val strictMode = Prefs.readLocalStrictMode(context)
+    val allowlist = Prefs.readLocalAllowlist(context)
     return try {
         // 与主列表相同的四类声明标记。不把“声明 SDK”说成“已注册/正在使用 FCM”。
         val candidates = pm.getInstalledApplications(0)
@@ -146,7 +151,9 @@ private fun basicDiagnostics(context: Context): BasicDiagnostics {
         }
         BasicDiagnostics(installed, candidates.filter { it.packageName in supported && it.packageName != context.packageName }
             .map { FcmApp(it.packageName, it.loadLabel(pm).toString(), true) }.sortedBy { it.label },
-            "名单由本机可见的组件声明识别；受应用列表权限限制时可能不完整。声明 FCM 不等于已成功注册，混合推送应用也可能使用其他通道。")
+            "名单由本机可见的组件声明识别；受应用列表权限限制时可能不完整。声明 FCM 不等于已成功注册，混合推送应用也可能使用其他通道。" +
+                if (strictMode) "严格模式已开启：未勾选的应用模块不插手，因此它们不会产生放行记录。" else "",
+            strictMode, allowlist)
     } catch (e: Exception) {
         BasicDiagnostics(installed, emptyList(), "应用列表读取失败：${e.javaClass.simpleName}。请检查系统授予本模块的应用列表权限。")
     }
@@ -160,7 +167,8 @@ internal fun statusItems(sample: GmsSample?, log: LogRead?, bound: Boolean): Lis
     add(DiagnosticItem("root", "Root 检测", if (sample.rootAvailable) "本次 shell 的 id -u 返回 0；仅执行只读命令。"
         else sample.raw, if (sample.rootAvailable) Verdict.OK else Verdict.UNKNOWN))
     add(DiagnosticItem("process", "GMS 进程", when {
-        !sample.processes.isNullOrEmpty() -> sample.processes.joinToString("\n") + "\n来源：Root ps，UID ${sample.uid}"
+        !sample.processes.isNullOrEmpty() -> sample.processes.joinToString("\n") +
+            "\n来源：Root ps（含分身/工作资料，分身 GMS 是独立 UID）"
         sample.sockets.orEmpty().any { it.established } -> "进程表未匹配，但该 UID 有已建立的 TCP socket。不能据此断言 GMS 未运行，请查看报告中的原始依据。"
         sample.processes == null -> "未取得可识别的进程表，不能判断运行状态。"
         else -> "本次进程表未发现 GMS。请检查 Google Play 服务是否启用；这不证明进程被杀，也不能保证下一条推送会将其拉起。"
@@ -346,7 +354,8 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
             if (sockets.isNullOrEmpty()) item("socket-empty") {
                 Note(if (sockets == null) "未取得可读 socket 表，不代表离线。" else "本次表中没有 GMS UID 的 TCP 连接。")
             } else items(sockets, key = { "socket-${it.key}" }) { socket ->
-                DetailCard(socket.endpoint, "${socket.stateLabel} · ${if (socket.pushCandidate) "推送端口候选" else "用途未确认"}\nTCP 状态不能证明消息送达。")
+                DetailCard(socket.endpoint, "${socket.stateLabel} · ${if (socket.pushCandidate) "推送端口候选" else "用途未确认"}" +
+                    " · ${socket.userLabel}（uid=${socket.uid}）\nTCP 状态不能证明消息送达。")
             }
             item("observation") {
                 val o = observation
@@ -361,8 +370,14 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
             if (apps.isEmpty()) item("app-empty") { Note("当前未识别到声明 FCM 的应用；请确认应用列表权限。") }
             items(apps, key = { "app-${it.pkg}" }) { app ->
                 val count = counts[app.pkg]
+                val inAllowlist = current?.basic?.allowlist?.contains(app.pkg) == true
                 DetailCard(app.label, "${app.pkg}\n${if (app.declared) "声明了 FCM 组件" else "日志中观察到广播放行"}" +
-                    (count?.let { "\n放行记录 ${it.count} 条 · 最近 ${it.lastStamp}" } ?: "\n当前日志片段中没有放行记录，不代表从未收到推送。"))
+                    (count?.let { "\n放行记录 ${it.count} 条 · 最近 ${it.lastStamp}" } ?: run {
+                        // 严格模式下未勾选的应用门控不插手，"没有放行记录"是设计行为。
+                        if (current?.basic?.strictMode == true && !inAllowlist)
+                            "\n严格模式下未勾选：门控不接管该应用，没有放行记录属正常"
+                        else "\n当前日志片段中没有放行记录，不代表从未收到推送"
+                    }))
             }
             item("section-events") { Heading("最近模块活动") }
             if (log?.lines.isNullOrEmpty()) item("log-empty") { Note("当前没有可解释的本模块记录。日志不可读、路径不兼容或片段为空都可能造成这一结果，详情请导出报告。") }

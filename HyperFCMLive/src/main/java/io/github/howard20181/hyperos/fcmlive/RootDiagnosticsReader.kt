@@ -82,10 +82,17 @@ internal object RootDiagnosticsReader {
             val aurogon = read(shell, "Aurogon 门控", "settings get global aurogon_enable")
             val deviceIdle = read(shell, "Doze 白名单", "dumpsys deviceidle whitelist")
             evidence += listOf(ps, tcp4, tcp6, greezer, boot, millet, aurogon, deviceIdle)
-            val processes = if (ps.ok && uid != null) DiagnosticsParser.processes(ps.lines, uid) else null
+            val processes = if (ps.ok && uid != null) DiagnosticsParser.allGmsProcesses(ps.lines) else null
             val v4 = if (tcp4.ok && uid != null) DiagnosticsParser.sockets(tcp4.lines, uid) else null
             val v6 = if (tcp6.ok && uid != null) DiagnosticsParser.sockets(tcp6.lines, uid) else null
-            val sockets = if (v4 == null && v6 == null) null else (v4.orEmpty() + v6.orEmpty()).distinctBy { it.key }
+            // 主用户 socket + 所有用户的推送端口连接合并：分身/工作资料的 GMS
+            // 是独立 UID，只按当前用户匹配会把它们的连接漏掉。
+            val allV4 = if (tcp4.ok) DiagnosticsParser.allGmsSockets(tcp4.lines) else null
+            val allV6 = if (tcp6.ok) DiagnosticsParser.allGmsSockets(tcp6.lines) else null
+            val sockets = if (v4 == null && v6 == null && allV4 == null && allV6 == null) null
+                else (v4.orEmpty() + v6.orEmpty() + allV4.orEmpty() + allV6.orEmpty())
+                    .distinctBy { it.key }
+                    .ifEmpty { null }
 
             // 仅枚举已知的当前日志目录，不递归读取其他模块的私有数据。
             val paths = read(shell, "LSPosed 日志定位", """

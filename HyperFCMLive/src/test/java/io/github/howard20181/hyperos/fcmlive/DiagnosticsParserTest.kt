@@ -90,6 +90,43 @@ class DiagnosticsParserTest {
         assertNull(DiagnosticsParser.deviceIdleGms(emptyList()))
     }
 
+    @Test fun multiUidMatchingCoversCloneAndWorkProfileGms() {
+        val ps = listOf("UID PID NAME", "10132 1 com.google.android.gms.persistent",
+            "10133 2 com.google.android.gms:unstable", "11999 3 com.google.android.gms",
+            "110133 4 com.google.android.gms", "1000 5 com.google.android.gms",
+            "10133 6 com.google.android.gms.evil")
+        val all = DiagnosticsParser.allGmsProcesses(ps)!!
+        assertEquals(4, all.size)
+        assertTrue(all.any { it.contains("uid=10132") })
+        assertTrue(all.any { it.contains("uid=10133") })
+        assertTrue(all.any { it.contains("uid=110133") })
+        assertTrue(all.none { it.contains("uid=1000") })
+        assertTrue(all.none { it.contains("evil") })
+        // 主用户 10000-19999、分身/工作资料 110000-159999 都是应用段。
+        assertTrue(DiagnosticsParser.isAppUid(10133))
+        assertTrue(DiagnosticsParser.isAppUid(110133))
+        assertFalse(DiagnosticsParser.isAppUid(1000))
+        assertFalse(DiagnosticsParser.isAppUid(999))
+    }
+
+    @Test fun allGmsSocketsKeepPushPortsAndTagUsers() {
+        val header = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode"
+        fun socket(remote: String, state: String, uid: Int) =
+            "0: 0100007F:C000 $remote $state 00000000:00000000 00:00000000 00000000 $uid 0 456 1"
+        val sockets = DiagnosticsParser.allGmsSockets(listOf(header,
+            socket("0100007F:146C", "01", 10132),
+            socket("0100007F:146D", "01", 110133),
+            socket("0100007F:01BB", "01", 10132),
+            socket("0100007F:146C", "01", 1000)))!!
+        // 只保留推送端口 + 应用段 UID；443 与系统 UID 被过滤。
+        assertEquals(2, sockets.size)
+        assertEquals(5228, sockets[0].port)
+        assertEquals("主用户", sockets[0].userLabel)
+        assertEquals(110133, sockets[1].uid)
+        assertEquals("用户 1", sockets[1].userLabel)
+        assertNull(DiagnosticsParser.allGmsSockets(listOf("Permission denied")))
+    }
+
     @Test fun socketOverviewUsesTheSameSnapshotAsDetails() {
         val sockets = DiagnosticsParser.sockets(listOf(header, socket("0100007F:146C")), 10133)
         val sample = GmsSample(10133, "test", emptyList(), sockets, null, "boot", 0,
