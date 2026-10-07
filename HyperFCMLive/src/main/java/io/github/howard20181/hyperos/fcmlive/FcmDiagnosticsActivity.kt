@@ -365,10 +365,14 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
                 bottom = padding.calculateBottomPadding() + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (busy) item("progress") { LinearProgressIndicator(Modifier.fillMaxWidth()) }
             item("root-button") {
+                // contentPadding 与 Note 的 8dp 对齐，否则按钮文字比下方说明凸出一截。
                 TextButton(enabled = !busy, onClick = {
                     rootRequested = true
                     scope.launch { reload(true) }
-                }) { Text(if (rootRequested) "重新进行 Root 检测" else "以 Root 检测") }
+                }, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                    Text(if (rootRequested) "重新进行 Root 检测" else "以 Root 检测",
+                        style = MaterialTheme.typography.labelMedium)
+                }
                 Note("只读检查进程、网络与模块日志；不自动修复或更改系统设置。")
             }
             error?.let { item("error") { Note(it) } }
