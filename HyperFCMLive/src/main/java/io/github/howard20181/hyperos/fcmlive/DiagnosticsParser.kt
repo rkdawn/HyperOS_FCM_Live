@@ -40,16 +40,21 @@ internal object DiagnosticsParser {
         return (gmsLines.isNotEmpty()) to gmsLines
     }
 
+    /** GMS 及其子进程。子进程名用已知白名单（unstable/persistent 及冒号服务），
+     *  不用任意点号前缀——gms.feedback、gms.evil 这类同前缀包会被误收。 */
     fun gmsProcessName(name: String): Boolean =
-        name == GMS || name == "$GMS.persistent" || name.startsWith("$GMS:")
+        name == GMS || name == "$GMS.persistent" || name.startsWith("$GMS:") ||
+            name.startsWith("$GMS.unstable")
 
     /**
-     * Android UID 按 100000 分段：每个用户（主用户 0、分身 999、工作资料 10+）
-     * 里的 GMS 各有自己的 UID。按"UID % 100000 的应用段内包名不可区分"这一
-     * 限制，进程名本身已经过滤了 GMS，这里只需确认 UID 是合法应用段，
-     * 就能同时覆盖主用户和分身/工作资料的 GMS 进程。
+     * 应用段 UID 判断：Android UID = 用户号 × 100000 + 应用号，应用号占
+     * 10000–19999。对 UID 取模即可覆盖主用户（10132）、手机分身（99910132）
+     * 和工作资料（1010132）里的所有应用进程，不必枚举用户段。
      */
-    fun isAppUid(uid: Int): Boolean = uid >= 10000 && uid <= 19999 || uid >= 110000 && uid <= 159999
+    fun isAppUid(uid: Int): Boolean {
+        val appId = uid % 100000
+        return appId in 10000..19999
+    }
 
     /**
      * 定位 ps 表头里的 UID/PID/NAME 三列，而不是假设它们固定在第 0/1/2 列。
@@ -80,7 +85,7 @@ internal object DiagnosticsParser {
         return result.distinct()
     }
 
-    /** 覆盖所有用户的 GMS 进程行，按用户段标注。 */
+    /** 覆盖所有用户的 GMS 进程行，标注用户与进程角色。 */
     fun allGmsProcesses(lines: List<String>): List<String>? {
         val rows = lines.filter { it.isNotBlank() }.map { it.trim().split(whitespace) }
         val header = rows.firstOrNull() ?: return null
@@ -92,7 +97,19 @@ internal object DiagnosticsParser {
             val pid = fields[cols.pid].toIntOrNull() ?: return null
             val name = fields.drop(cols.name).joinToString(" ")
             if (isAppUid(rowUid) && gmsProcessName(name)) {
-                result += "$name（uid=$rowUid, pid=$pid）"
+                val user = when (rowUid / 100000) {
+                    0 -> ""
+                    999 -> "，手机分身"
+                    else -> "，用户 ${rowUid / 100000}"
+                }
+                val role = when (name) {
+                    GMS -> "主进程"
+                    "$GMS.persistent" -> "常驻进程"
+                    else -> if (name.startsWith("$GMS.unstable")) "主工作进程"
+                        else if (name.startsWith("$GMS.")) "子进程"
+                        else "子服务"
+                }
+                result += "$name（pid=$pid$user，$role）"
             }
         }
         return result.distinct()
@@ -109,7 +126,7 @@ internal object DiagnosticsParser {
         val established get() = state == "01"
         // 443 是通用 HTTPS，不能仅凭端口判定是推送连接。
         val pushCandidate get() = port in 5228..5230
-        /** UID % 100000 得到用户内应用编号；0 是主用户，999 是分身，10+ 是工作资料。 */
+        /** UID 取模得到应用号所在用户；0 是主用户，999 是手机分身，10+ 是工作资料。 */
         val userLabel get() = when (val u = uid / 100000) {
             0 -> "主用户"
             999 -> "手机分身"

@@ -48,7 +48,7 @@ android {
         targetSdkVersion 37
         // 本地验证包使用独立版本号，避免多份不同 APK 共用同一版本。
         // 版本名保持纯数字，兼容现有更新器的逐段比较。
-        versionCode 45
+        versionCode 46
         versionName "3.6.3"
 
         // HyperOS modules ship arm64 only; drop armv7a / x86 / x86_64 natives.

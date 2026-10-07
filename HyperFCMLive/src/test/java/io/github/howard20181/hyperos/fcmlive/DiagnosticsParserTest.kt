@@ -36,11 +36,13 @@ class DiagnosticsParserTest {
     @Test fun findsPersistentAndColonProcessesOnlyInCorrectUser() {
         val ps = listOf("UID PID NAME", "10133 1 com.google.android.gms.persistent",
             "10133 2 com.google.android.gms:unstable", "10133 3 com.google.android.gms.evil",
-            "110133 4 com.google.android.gms")
+            "99910132 4 com.google.android.gms.persistent")
+        // 单 UID 查询只匹配该 UID；点号前缀不再吞掉 gms.evil。
         assertEquals(listOf("com.google.android.gms.persistent", "com.google.android.gms:unstable"),
             DiagnosticsParser.processes(ps, 10133))
         assertNull(DiagnosticsParser.processes(listOf("access denied"), 10133))
         assertFalse(DiagnosticsParser.gmsProcessName("com.google.android.gmsfake"))
+        assertFalse(DiagnosticsParser.gmsProcessName("com.google.android.gms.evil"))
     }
 
     @Test fun unknownSamplingAndRebootNeverBecomeDisconnects() {
@@ -92,22 +94,33 @@ class DiagnosticsParserTest {
     }
 
     @Test fun multiUidMatchingCoversCloneAndWorkProfileGms() {
-        val ps = listOf("UID PID NAME", "10132 1 com.google.android.gms.persistent",
-            "10133 2 com.google.android.gms:unstable", "11999 3 com.google.android.gms",
-            "110133 4 com.google.android.gms", "1000 5 com.google.android.gms",
+        // 来自真机 build 45 报告的 ps 原始输出：主用户 + 999 分身 + unstable 子进程。
+        val ps = listOf("  UID   PID NAME",
+            "10132  7338 com.google.android.gms",
+            "99910132 9236 com.google.android.gms",
+            "99910132 11446 com.google.android.gms.unstable",
+            "10132 12330 com.google.android.gms.unstable",
+            "1000 5 com.google.android.gms",
             "10133 6 com.google.android.gms.evil")
         val all = DiagnosticsParser.allGmsProcesses(ps)!!
+        // 点号前缀只认白名单（unstable），gms.evil 与 1000 系统 UID 均被排除。
         assertEquals(4, all.size)
-        assertTrue(all.any { it.contains("uid=10132") })
-        assertTrue(all.any { it.contains("uid=10133") })
-        assertTrue(all.any { it.contains("uid=110133") })
-        assertTrue(all.none { it.contains("uid=1000") })
+        assertTrue(all.any { it.contains("pid=7338") && it.contains("主进程") })
+        assertTrue(all.any { it.contains("pid=12330") && it.contains("主工作进程") })
+        assertTrue(all.any { it.contains("手机分身") && it.contains("pid=9236") })
+        assertTrue(all.any { it.contains("手机分身") && it.contains("pid=11446") })
         assertTrue(all.none { it.contains("evil") })
-        // 主用户 10000-19999、分身/工作资料 110000-159999 都是应用段。
+        assertTrue(all.none { it.contains("pid=5）") })
+        assertTrue(all.none { it.contains("evil") })
+        // 取模判断覆盖主用户、分身、工作资料；系统 UID 与纯服务 UID 排除。
         assertTrue(DiagnosticsParser.isAppUid(10133))
-        assertTrue(DiagnosticsParser.isAppUid(110133))
+        assertTrue(DiagnosticsParser.isAppUid(99910132))
+        assertTrue(DiagnosticsParser.isAppUid(1010132))
         assertFalse(DiagnosticsParser.isAppUid(1000))
         assertFalse(DiagnosticsParser.isAppUid(999))
+        // 点号前缀匹配 unstable，排除伪装包名。
+        assertTrue(DiagnosticsParser.gmsProcessName("com.google.android.gms.unstable"))
+        assertFalse(DiagnosticsParser.gmsProcessName("com.google.android.gmsfake"))
     }
 
     @Test fun allGmsSocketsKeepPushPortsAndTagUsers() {
@@ -116,15 +129,15 @@ class DiagnosticsParserTest {
             "0: 0100007F:C000 $remote $state 00000000:00000000 00:00000000 00000000 $uid 0 456 1"
         val sockets = DiagnosticsParser.allGmsSockets(listOf(header,
             socket("0100007F:146C", "01", 10132),
-            socket("0100007F:146D", "01", 110133),
+            socket("0100007F:146D", "01", 99910132),
             socket("0100007F:01BB", "01", 10132),
             socket("0100007F:146C", "01", 1000)))!!
         // 只保留推送端口 + 应用段 UID；443 与系统 UID 被过滤。
         assertEquals(2, sockets.size)
         assertEquals(5228, sockets[0].port)
         assertEquals("主用户", sockets[0].userLabel)
-        assertEquals(110133, sockets[1].uid)
-        assertEquals("用户 1", sockets[1].userLabel)
+        assertEquals(99910132, sockets[1].uid)
+        assertEquals("手机分身", sockets[1].userLabel)
         assertNull(DiagnosticsParser.allGmsSockets(listOf("Permission denied")))
     }
 

@@ -161,59 +161,90 @@ private fun basicDiagnostics(context: Context): BasicDiagnostics {
 
 internal fun statusItems(sample: GmsSample?, log: LogRead?, bound: Boolean): List<DiagnosticItem> = buildList {
     if (sample == null) {
-        add(DiagnosticItem("root", "Root 检测", "点击“以 Root 检测”申请并验证 UID 0。已被 Root 管理器记住的授权可能不再弹窗。", Verdict.UNKNOWN))
+        add(DiagnosticItem("root", "还没做 Root 检测",
+            "点上面的“以 Root 检测”按钮就能查：推送连接、系统有没有拦、模块干没干活都需要它。\n已授权过的手机不会再弹窗，直接点就行。", Verdict.UNKNOWN))
         return@buildList
     }
-    add(DiagnosticItem("root", "Root 检测", if (sample.rootAvailable) "本次 shell 的 id -u 返回 0；仅执行只读命令。"
-        else sample.raw, if (sample.rootAvailable) Verdict.OK else Verdict.UNKNOWN))
-    add(DiagnosticItem("process", "GMS 进程", when {
-        !sample.processes.isNullOrEmpty() -> sample.processes.joinToString("\n") +
-            "\n来源：Root ps（含分身/工作资料，分身 GMS 是独立 UID）"
-        sample.sockets.orEmpty().any { it.established } -> "进程表未匹配，但该 UID 有已建立的 TCP socket。不能据此断言 GMS 未运行，请查看报告中的原始依据。"
-        sample.processes == null -> "未取得可识别的进程表，不能判断运行状态。"
-        else -> "本次进程表未发现 GMS。请检查 Google Play 服务是否启用；这不证明进程被杀，也不能保证下一条推送会将其拉起。"
-    }, when {
-        !sample.processes.isNullOrEmpty() -> Verdict.OK
-        sample.processes == null || sample.sockets.orEmpty().any { it.established } -> Verdict.UNKNOWN
-        else -> Verdict.ATTENTION
-    }))
-    add(DiagnosticItem("socket", "GMS 推送通道", when (sample.observedOnline) {
-        true -> "发现 ${sample.pushSockets.size} 条 UID ${sample.uid} 的 5228–5230 端口 TCP 已建立连接。仅是推送通道候选，不能证明 FCM 已登录或消息已送达。"
-        false -> "本次完整 socket 表未发现推送端口连接。443 可能用于回退，也可能是普通 HTTPS；请结合官方诊断页检查，不能直接判为掉线。"
-        null -> "网络表或 UID 读取不完整，状态未知；不会计作掉线。"
+    add(DiagnosticItem("root", "Root 权限",
+        "正常，已用 Root 读取系统信息（只读，不改任何设置）。", Verdict.OK))
+    add(DiagnosticItem("process", "谷歌服务在运行吗",
+        when {
+            !sample.processes.isNullOrEmpty() ->
+                "在运行。共 ${sample.processes.size} 个谷歌服务进程" +
+                    (if (sample.processes.any { it.contains("手机分身") }) "（含手机分身里的）" else "") + "。"
+            sample.sockets.orEmpty().any { it.established } ->
+                "进程列表没读到，但它的网络连接是活的，所以大概率在运行。"
+            sample.processes == null -> "读不到进程列表，无法确认。"
+            else -> "本次没看到谷歌服务进程。如果推送正常就不用管；收不到推送时先检查谷歌服务是否被禁用。"
+        } + when {
+            sample.processes == null -> "\n技术细节：ps 表解析失败"
+            else -> "\n技术细节：${sample.processes.joinToString("；")}"
+        }, when {
+            !sample.processes.isNullOrEmpty() -> Verdict.OK
+            sample.processes == null || sample.sockets.orEmpty().any { it.established } -> Verdict.UNKNOWN
+            else -> Verdict.ATTENTION
+        }))
+    add(DiagnosticItem("socket", "能收到推送吗（连接状态）", when (sample.observedOnline) {
+        true -> "能。谷歌服务已连上推送服务器${if (sample.pushSockets.size > 1) "（${sample.pushSockets.size} 条连接）" else ""}，推送消息从这条通道下来。\n注意：连接在线只说明通道是通的，不保证每条消息都成功送达。"
+        false -> "本次没有发现推送连接。可能是刚断开还没重连，也可能网络有问题——稍等再刷新一次，或用底部“打开 GMS 官方诊断”看实时状态。"
+        null -> "读不到网络连接表，无法确认。"
     }, if (sample.observedOnline == true) Verdict.OK else Verdict.UNKNOWN))
-    add(DiagnosticItem("gate", "系统 GMS 限制开关", when (sample.gmsLimitEnabled) {
-        true -> "dumpsys greezer：mGmsLimitEnabled=true。表示这一策略开关开启，不代表当前已断网。若消息延迟，请导出报告核对模块作用域与实际拦截记录。"
-        false -> "dumpsys greezer：mGmsLimitEnabled=false。仅这一项限制关闭，不代表其他省电/网络限制全部解除。"
-        null -> "命令失败、字段缺失或输出格式不认识，无法判断。没有把它默认成“关闭”。"
-    }, if (sample.gmsLimitEnabled == null) Verdict.UNKNOWN else if (sample.gmsLimitEnabled) Verdict.ATTENTION else Verdict.OK))
-    add(DiagnosticItem("millet", "MILLET 免限名单", when (sample.milletContainsGms) {
-        true -> "Settings.System.MILLET_NO_RESTRICT_APP 已含 com.google.android.gms。这是本模块 hook 的关键防护面；名单存在不等于 GMS 此刻未被冻结，也不等于消息已送达。"
-        false -> "MILLET_NO_RESTRICT_APP 当前不含 GMS。请确认模块已启用并在 LSPosed 勾选作用域；若仍缺失，导出报告核对 greezer 与模块日志。"
-        null -> "读不到该设置（可能非 HyperOS 或字段名不同），状态未知；不会判为已失效。"
-    }, when (sample.milletContainsGms) { true -> Verdict.OK; false -> Verdict.ATTENTION; null -> Verdict.UNKNOWN }))
-    add(DiagnosticItem("aurogon", "Aurogon 广播门控", when (sample.aurogonConfigured) {
-        true -> "Settings.Global.aurogon_enable 已配置。仅表示存在门控设置，具体放行规则需结合 c2dm 声明与模块日志判断。"
-        false -> "未配置 Aurogon 门控（本 ROM 可能不启用该路径，属正常）。不是故障。"
-        null -> "读不到该设置，状态未知。"
-    }, if (sample.aurogonConfigured == null) Verdict.UNKNOWN else Verdict.INFO))
-    add(DiagnosticItem("doze", "Doze 省电白名单", when (sample.deviceIdleGms) {
-        true -> "deviceidle 白名单含 GMS（user/system/system-excidle）。这是省电豁免，与 greezer 冻结是两条独立路径，不能互相替代。"
-        false -> "deviceidle 白名单未含 GMS。睡眠保活相关的网络保持可能受影响，请结合模块日志。"
-        null -> "读不到 Doze 白名单，状态未知。"
-    }, when (sample.deviceIdleGms) { true -> Verdict.OK; false -> Verdict.ATTENTION; null -> Verdict.UNKNOWN }))
+    add(DiagnosticItem("gate", "系统在限制谷歌服务吗", when (sample.gmsLimitEnabled) {
+        false -> "这一项限制是关的，系统没有主动卡谷歌推送。"
+        true -> "系统有个针对谷歌服务的限制开关是开着的。不用慌：你的模块就是来对付它的，且推送连接仍然在线。\n只有当推送变慢时才需要关注这项。"
+        null -> "读不到这个开关的状态，无法判断。"
+    } + "\n技术细节：dumpsys greezer 的 mGmsLimitEnabled=${sample.gmsLimitEnabled ?: "未知"}",
+        if (sample.gmsLimitEnabled == null) Verdict.UNKNOWN else if (sample.gmsLimitEnabled) Verdict.ATTENTION else Verdict.OK))
+    add(DiagnosticItem("millet", "谷歌服务在防冻结名单里吗", when (sample.milletContainsGms) {
+        true -> "在。这是模块最关键的保护——防止系统锁屏后把谷歌服务“冻住”导致推送收不到。"
+        false -> "不在！模块没起作用。请确认：LSPosed 里模块已启用、作用域勾了“系统”和“电源管理”，然后重启手机。"
+        null -> "读不到这个名单，无法确认。"
+    } + "\n技术细节：MILLET_NO_RESTRICT_APP 设置项",
+        when (sample.milletContainsGms) { true -> Verdict.OK; false -> Verdict.ATTENTION; null -> Verdict.UNKNOWN }))
+    add(DiagnosticItem("aurogon", "广播拦截配置", when (sample.aurogonConfigured) {
+        true -> "系统配置了广播拦截规则（具体放行情况看下面的模块活动记录）。"
+        false -> "你的系统没启用这套广播拦截，属于正常，不是故障。"
+        null -> "读不到，无法判断。"
+    } + "\n技术细节：Settings.Global.aurogon_enable", if (sample.aurogonConfigured == null) Verdict.UNKNOWN else Verdict.INFO))
+    add(DiagnosticItem("doze", "省电模式会卡推送吗", when (sample.deviceIdleGms) {
+        true -> "不会。谷歌服务在系统省电豁免名单里，深度省电时也保持联网。"
+        false -> "谷歌服务不在省电豁免名单里。锁屏深度省电时推送可能变慢，模块会尝试自动补入。"
+        null -> "读不到省电白名单，无法确认。"
+    } + "\n技术细节：dumpsys deviceidle whitelist", when (sample.deviceIdleGms) {
+        true -> Verdict.OK; false -> Verdict.ATTENTION; null -> Verdict.UNKNOWN
+    }))
     val installations = log?.lines.orEmpty().filter { it.message.startsWith("HyperFCMLive active in ") }
-    add(DiagnosticItem("hook", "模块安装日志", if (installations.isEmpty())
-        "当前读取片段没有安装摘要。可能是日志轮转、路径不同或没有记录；这不等于未注入。请在 LSPosed 确认作用域，导出报告查看日志来源。"
-        else installations.takeLast(2).joinToString("\n") { "${it.stamp} ${it.message}" } +
-            "\n这是历史安装记录，不是当前每个 Hook 的健康证明。",
-        if (installations.isEmpty()) Verdict.UNKNOWN else Verdict.INFO))
-    add(DiagnosticItem("prefs", "模块配置通道", if (bound)
-        "已取得 libxposed 远程配置通道；不能据此证明系统侧全部 Hook 生效。"
-        else "当前未绑定配置服务。若一直如此，请检查 LSPosed 中的模块启用情况。",
+    add(DiagnosticItem("hook", "模块装好了吗", if (installations.isEmpty())
+        "没找到安装记录。可能模块刚装还没生效，建议重启手机后再看。"
+        else "装好了。模块已注入系统核心和电源管理${installations.size}次记录，0 个钩子缺失" +
+            "（安装于 ${installations.lastOrNull()?.stamp?.substringBefore('.') ?: "未知时间"}）。"
+    , if (installations.isEmpty()) Verdict.UNKNOWN else Verdict.INFO))
+    add(DiagnosticItem("prefs", "设置同步", if (bound)
+        "正常，你在主界面的勾选能实时传给模块。"
+        else "未连接。主界面改的名单可能传不到模块——检查 LSPosed 是否启用了本模块。",
         if (bound) Verdict.OK else Verdict.UNKNOWN))
-    add(DiagnosticItem("logs", "日志来源", (log?.evidence ?: "未读取") +
-        "\n识别出 ${log?.lines?.size ?: 0} 条本模块记录。", if (log?.ok == true) Verdict.INFO else Verdict.UNKNOWN))
+    add(DiagnosticItem("logs", "诊断依据", "从 ${log?.evidence?.lineSequence()?.firstOrNull()?.substringAfterLast('/') ?: "日志"} 读取了 ${log?.lines?.size ?: 0} 条模块记录。完整数据可点底部“导出诊断报告”。",
+        if (log?.ok == true) Verdict.INFO else Verdict.UNKNOWN))
+}
+
+/** 顶部总体结论：把所有检测项浓缩成一句人话 + 分数。 */
+internal fun overallSummary(sample: GmsSample?, log: LogRead?, bound: Boolean): Pair<String, Verdict> {
+    if (sample == null) return "先点“以 Root 检测”，才能告诉你推送链路的整体状况" to Verdict.UNKNOWN
+    val items = statusItems(sample, log, bound)
+    val attention = items.count { it.verdict == Verdict.ATTENTION }
+    val unknown = items.count { it.verdict == Verdict.UNKNOWN }
+    val online = sample.observedOnline == true
+    val protected = sample.milletContainsGms == true && sample.deviceIdleGms == true
+    return when {
+        online && protected && attention == 0 ->
+            "推送链路正常：连接在线，系统没有卡推送，模块保护已生效" to Verdict.OK
+        online && protected ->
+            "推送基本正常（连接在线、保护生效），但有 $attention 项建议留意，见下方标黄的项目" to Verdict.INFO
+        online ->
+            "连接在线但保护不完整，可能有 ${unknown}项无法确认；推送目前能用，建议关注标黄项" to Verdict.INFO
+        else ->
+            "推送连接未确认在线${if (attention > 0) "，有 $attention 项需要检查" else ""}。如果收不到推送，先看下方标黄的项目" to Verdict.UNKNOWN
+    }
 }
 
 /** 人话解释只表达日志真正证明的事实，保留原文供核对。 */
@@ -342,9 +373,15 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
             }
             error?.let { item("error") { Note(it) } }
             item("section-status") { Heading("状态与处理建议") }
+            item("overall") {
+                val (text, verdict) = overallSummary(snapshot?.sample, log, bound)
+                DetailCard("总体状态", text, verdict)
+            }
             current?.let {
-                item("installed") { DetailCard("Google Play 服务（GMS）",
-                    when (it.basic.installed) { true -> "已查询到安装信息"; false -> "未查询到安装信息；先检查系统是否启用谷歌基础服务"; null -> "读取失败，安装状态未知" }) }
+                item("installed") { DetailCard("谷歌服务装了吗",
+                    when (it.basic.installed) { true -> "装了，基础条件没问题。"
+                        false -> "没装或被禁用——没有谷歌服务，推送不可能工作，先解决这个。"
+                        null -> "读取失败，无法确认。" }) }
             }
             items(statusItems(snapshot?.sample, log, bound), key = { it.id }) { row ->
                 DetailCard(row.title, row.detail, row.verdict)
@@ -417,6 +454,16 @@ private fun DetailCard(title: String, detail: String, verdict: Verdict = Verdict
                 color = when (verdict) { Verdict.ATTENTION -> MaterialTheme.colorScheme.error
                     Verdict.OK -> MaterialTheme.colorScheme.primary; else -> MaterialTheme.colorScheme.onSurfaceVariant })
         }
-        Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        // 第一段是人话结论（正常字号），"技术细节："起的内容弱化为小字。
+        val splitPoint = detail.indexOf("\n技术细节：")
+        if (splitPoint < 0) {
+            Text(detail, style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            Text(detail.take(splitPoint), style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface)
+            Text(detail.substring(splitPoint + 1), style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline)
+        }
     }
 }

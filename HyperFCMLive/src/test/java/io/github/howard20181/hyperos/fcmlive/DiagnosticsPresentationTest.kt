@@ -21,7 +21,26 @@ class DiagnosticsPresentationTest {
         assertEquals(Verdict.ATTENTION, rows.getValue("millet").verdict)
         assertEquals(Verdict.INFO, rows.getValue("aurogon").verdict)
         assertEquals(Verdict.OK, rows.getValue("doze").verdict)
-        assertTrue(rows.getValue("millet").detail.contains("不含 GMS"))
+        assertTrue(rows.getValue("millet").detail.contains("模块没起作用"))
+    }
+
+    @Test fun summarySpeaksHumanLanguageAndReflectsOverallState() {
+        // 全绿：一句话给出"正常"。
+        val healthy = sample().copy(processes = listOf("com.google.android.gms（pid=7338，主进程）"),
+            sockets = listOf(DiagnosticsParser.Socket("k", "1.2.3.4", 5228, "01", "1", 10132)),
+            gmsLimitEnabled = false, milletContainsGms = true, deviceIdleGms = true)
+        val (goodText, goodVerdict) = overallSummary(healthy, null, true)
+        assertEquals(Verdict.OK, goodVerdict)
+        assertTrue(goodText.contains("正常"))
+        assertTrue(goodText.contains("连接在线"))
+        // 缺 MILLET：不能说"完全正常"。
+        val (midText, midVerdict) = overallSummary(healthy.copy(milletContainsGms = false), null, true)
+        assertTrue(midVerdict != Verdict.OK)
+        assertTrue(midText.contains("保护不完整"))
+        // 未做 Root：明确引导而不是报错。
+        val (noneText, noneVerdict) = overallSummary(null, null, false)
+        assertEquals(Verdict.UNKNOWN, noneVerdict)
+        assertTrue(noneText.contains("以 Root 检测"))
     }
 
     @Test fun connectedSocketDoesNotImplyProcessStoppedOrMessageDelivered() {
@@ -30,8 +49,9 @@ class DiagnosticsPresentationTest {
             .associateBy { it.id }
         assertEquals(Verdict.UNKNOWN, rows.getValue("process").verdict)
         assertEquals(Verdict.OK, rows.getValue("socket").verdict)
-        assertTrue(rows.getValue("socket").detail.contains("不能证明"))
-        assertTrue(rows.getValue("process").detail.contains("不能据此断言"))
+        // 连接在线不能说"保证送达"，进程未读不能说"已停止"。
+        assertTrue(rows.getValue("socket").detail.contains("不保证"))
+        assertTrue(rows.getValue("process").detail.contains("大概率在运行"))
     }
 
     @Test fun explanationsKeepGateTrafficAndRecoveryWithinTheirEvidence() {
