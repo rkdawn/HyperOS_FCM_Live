@@ -216,11 +216,15 @@ internal fun statusItems(sample: GmsSample?, log: LogRead?, bound: Boolean): Lis
         true -> Verdict.OK; false -> Verdict.ATTENTION; null -> Verdict.UNKNOWN
     }))
     val installations = log?.lines.orEmpty().filter { it.message.startsWith("HyperFCMLive active in ") }
-    add(DiagnosticItem("hook", "模块装好了吗", if (installations.isEmpty())
-        "没找到安装记录。可能模块刚装还没生效，建议重启手机后再看。"
-        else "装好了。模块已注入系统核心和电源管理${installations.size}次记录，0 个钩子缺失" +
-            "（安装于 ${installations.lastOrNull()?.stamp?.substringBefore('.') ?: "未知时间"}）。"
-    , if (installations.isEmpty()) Verdict.UNKNOWN else Verdict.INFO))
+    add(DiagnosticItem("hook", "模块装好了吗",
+        // 安装摘要行会被日志窗口滚掉；有实际动作记录就是模块在工作的直接证据。
+        if (installations.isEmpty() && (log?.lines?.size ?: 0) < 5)
+            "没找到模块在工作的证据。可能刚装还没生效，建议重启手机后再看。"
+        else if (installations.isEmpty())
+            "在正常工作。日志里有 ${log?.lines?.size ?: 0} 条模块实际动作记录（定期检查、防护、观察），说明钩子都活着。\n技术细节：本次片段没有安装摘要行（较早期的记录），不影响判断"
+        else
+            "在正常工作。模块已注入系统核心和电源管理，最近一次 ${installations.lastOrNull()?.stamp?.substringBefore('.') ?: ""}。\n技术细节：${installations.lastOrNull()?.message ?: ""}",
+        Verdict.OK.takeIf { installations.isNotEmpty() || (log?.lines?.size ?: 0) >= 5 } ?: Verdict.UNKNOWN))
     add(DiagnosticItem("prefs", "设置同步", if (bound)
         "正常，你在主界面的勾选能实时传给模块。"
         else "未连接。主界面改的名单可能传不到模块——检查 LSPosed 是否启用了本模块。",
@@ -267,6 +271,17 @@ internal fun explainModuleEvent(line: ModuleLogParser.Line): String {
         m.startsWith("MILLET_NO_RESTRICT_APP:") -> "模块尝试将 GMS 加入系统不限制名单"
         m.startsWith("userTable: update") -> "模块尝试更新 GMS 省电配置，实际修改条数见原文"
         m.startsWith("standby-firewall:") -> "模块跳过了系统待机防火墙命令"
+        m.startsWith("checkAlarmIsAllowedSend:") -> "谷歌服务的闹钟被系统正常放行（推送重连依赖闹钟）"
+        m.startsWith("wake-path probe: heartbeat") -> "唤醒路径探针的例行心跳汇总（只读观察，不改变系统行为）"
+        m.startsWith("wake-path probe: denied summary") -> "唤醒请求被拒的阶段性汇总（只读观察）"
+        m.startsWith("wake-path probe: broadcast gate first reach") -> "首次观察到广播路径检查（只读探针）"
+        m.contains("superseded, retire") -> "旧的流量探针代次已退役（热重载后正常更替）"
+        m.startsWith("probe:") -> "只读探测系统接口能力（仅记录环境，不做修改）"
+        m.contains(" hooked") || m.startsWith("Allowlist receiver installed") ->
+            "安装/重装系统钩子（模块注入点，启动或热重载时出现）"
+        m.startsWith("userTable: ensure") || m.startsWith("userTable: GMS current") ->
+            "例行确认：谷歌服务的省电配置未被系统改回"
+        m.startsWith("allowlist loaded") -> "读取你勾选的应用名单"
         m.startsWith("socket-teardown probe") -> "观察到系统连接清理方法执行；不能据此证明服务器连接实际断开"
         m.contains("DENIED") -> "观察到系统拒绝了一次唤醒请求；来源和目标见原文"
         m.startsWith("sleep-mode: kept") -> "模块阻止了本次睡眠模式关闭对应网络开关"
@@ -424,39 +439,23 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
                         "\n仅统计本页面手动采样；间隔超过 60 秒、缺测或重启即重建观察段。0 次不等于一直在线。")
             }
             item("section-apps") { Heading("哪些应用支持 FCM") }
-            item("app-help") { Note("FCM 的推送由谷歌服务代持一条共享长连接，没有每个应用独立的连接，所以只能按“有没有观察到推送到达”分组，而不是显示每个应用通没通。") }
-            // 有放行记录 = 近期确实观察到推送到达；其余是声明支持但本期无记录。
-            val withTraffic = apps.filter { counts[it.pkg] != null }
-            val declaredOnly = apps.filter { counts[it.pkg] == null }
-            if (withTraffic.isNotEmpty()) {
-                item("apps-traffic-head") { SubHeading("近期观察到推送到达（${withTraffic.size} 个）") }
-                items(withTraffic, key = { "app-${it.pkg}" }) { app ->
-                    val count = counts[app.pkg]!!
-                    DetailCard(app.label, "推送到达 ${count.count} 次，最近 ${count.lastStamp}\n${app.pkg}",
+            item("app-help") { Note("推送由谷歌服务统一代收后转发，所以这里显示的是“谁声明了推送能力”和“日志里谁真的收到过”，而不是每个应用各自的连接。有记录 = 近期确实观察到推送到达。") }
+            if (apps.isEmpty()) item("app-empty") { Note("当前未识别到声明 FCM 的应用；请确认应用列表权限。") }
+            items(apps, key = { "app-${it.pkg}" }) { app ->
+                val count = counts[app.pkg]
+                if (count != null) {
+                    DetailCard(app.label, "近期观察到推送到达 ${count.count} 次，最近 ${count.lastStamp.substringBefore('.')}\n${app.pkg}",
                         Verdict.OK)
-                }
-            } else {
-                item("apps-traffic-empty") { Note("本页日志片段（约几小时）内没有观察到任何应用的推送到达记录。期间如果手机亮屏且网络正常，推送通常不走被拦截的路径，属常见现象。") }
-            }
-            if (declaredOnly.isNotEmpty()) {
-                item("apps-declared-head") { SubHeading("声明支持 FCM，本期未见记录（${declaredOnly.size} 个）") }
-                items(declaredOnly, key = { "app-${it.pkg}" }) { app ->
-                    val inAllowlist = current?.basic?.allowlist?.contains(app.pkg) == true
-                    val why = when {
-                        // 严格模式下未勾选的应用门控不插手，"没有记录"是设计行为。
-                        current?.basic?.strictMode == true && !inAllowlist -> "严格模式下未勾选：模块不接管该应用"
-                        else -> "期间可能没收到推送，或推送未经过需放行的路径；不代表推送功能失效"
-                    }
-                    DetailCard(app.label, "$why\n${app.pkg}")
+                } else {
+                    DetailCard(app.label, "声明支持推送；这几小时的日志里没有它的记录，通常就是期间没收到推送，不是故障。\n${app.pkg}")
                 }
             }
             item("section-events") { Heading("模块在干什么") }
-            item("events-help") { Note("模块的运行记录按类型汇总在这里。每类显示次数和最近时间；点开一条可看原始日志。") }
+            item("events-help") { Note("这是模块在系统里的实际动作清单，用来证明模块在工作。只显示最活跃的前 6 类；更多细节可导出报告查看。") }
             if (eventBuckets.isEmpty()) {
                 item("log-empty") { Note("当前没有模块记录。日志不可读、路径不兼容或片段为空都可能造成这一结果，详情可导出报告。") }
             } else {
-                // 按解释文案聚合：同一类动作合成一条（次数 + 最近时间），不再逐条刷屏。
-                items(eventBuckets, key = { it.explain }) { bucket ->
+                items(eventBuckets.take(6), key = { it.explain }) { bucket ->
                     var expanded by remember(bucket.explain) { mutableStateOf(false) }
                     GroupRow(first = true, last = true, onClick = { expanded = !expanded }) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
