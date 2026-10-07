@@ -141,6 +141,10 @@ internal object RootDiagnosticsReader {
                 appendLine("启动标识：${if (boot.ok) boot.lines.joinToString() else "未知"}")
                 appendLine("GMS uid=$uid；来源：PackageManager 当前用户")
                 appendLine("GMS processes=${processes ?: "未知"}")
+                // 进程解析失败时保留 ps 表头和 GMS 相关行，便于核对 ROM 的列格式。
+                appendLine("--- ps 原始输出（表头 + 含 GMS 的行，最多 40 条）---")
+                (ps.lines.take(1) + ps.lines.drop(1).filter { it.contains("gms") }).take(40)
+                    .forEach { appendLine(it) }
                 sockets.orEmpty().forEach { appendLine("socket=${it.endpoint} state=${it.state} inode=${it.inode}") }
                 if (greezer.ok) greezer.lines.filter { it.contains("mGmsLimitEnabled") }.forEach { appendLine(it) }
                 if (millet.ok) appendLine("MILLET_NO_RESTRICT_APP=${millet.lines.joinToString(" ")}")

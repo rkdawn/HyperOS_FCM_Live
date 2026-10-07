@@ -59,7 +59,8 @@ class DiagnosticsParserTest {
         assertNull(DiagnosticsParser.sockets(listOf(header, "0: incomplete row"), 10133))
         assertNull(DiagnosticsParser.sockets(listOf(header, socket("invalid:146C")), 10133))
         assertNull(DiagnosticsParser.sockets(listOf(header, socket("0100007F:146C", "ZZ")), 10133))
-        assertNull(DiagnosticsParser.processes(listOf("NAME UID PID", "com.google.android.gms 10133 1"), 10133))
+        // 缺 NAME 列的表头无法定位，必须返回 null 而不是空表。
+        assertNull(DiagnosticsParser.processes(listOf("USER PID PPID", "10133 1 2"), 10133))
         assertNull(DiagnosticsParser.processes(listOf("UID PID NAME", "u0_a133 1 com.google.android.gms"), 10133))
         assertEquals(emptyList<String>(), DiagnosticsParser.processes(listOf("UID PID NAME"), 10133))
         assertNull(DiagnosticsParser.gmsLimitEnabled(listOf("mGmsLimitEnabled=false mGmsLimitEnabled=true")))
@@ -125,6 +126,17 @@ class DiagnosticsParserTest {
         assertEquals(110133, sockets[1].uid)
         assertEquals("用户 1", sockets[1].userLabel)
         assertNull(DiagnosticsParser.allGmsSockets(listOf("Permission denied")))
+    }
+
+    @Test fun processesSurviveColumnReorderingAndCase() {
+        // 真实 ps 里 NAME 是最后一列（进程名可能含空格）；测试列定位而不是固定位置。
+        val reordered = listOf("PID UID NAME", "1 10133 com.google.android.gms.persistent",
+            "2 10133 com.google.android.gms:unstable", "3 10133 com.example.app")
+        assertEquals(listOf("com.google.android.gms.persistent", "com.google.android.gms:unstable"),
+            DiagnosticsParser.processes(reordered, 10133))
+        val lowercase = listOf("uid pid name", "10133 7 com.google.android.gms.persistent")
+        assertEquals(listOf("com.google.android.gms.persistent"), DiagnosticsParser.processes(lowercase, 10133))
+        assertNull(DiagnosticsParser.processes(listOf("USER PID PPID VSZ"), 10133))
     }
 
     @Test fun socketOverviewUsesTheSameSnapshotAsDetails() {

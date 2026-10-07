@@ -51,30 +51,48 @@ internal object DiagnosticsParser {
      */
     fun isAppUid(uid: Int): Boolean = uid >= 10000 && uid <= 19999 || uid >= 110000 && uid <= 159999
 
+    /**
+     * 定位 ps 表头里的 UID/PID/NAME 三列，而不是假设它们固定在第 0/1/2 列。
+     * 不同 ROM 的 toybox ps 表头大小写、列顺序可能不同，写死位置会误判。
+     */
+    private data class PsColumns(val uid: Int, val pid: Int, val name: Int)
+
+    private fun psColumns(header: List<String>): PsColumns? {
+        val uid = header.indexOfFirst { it.equals("UID", true) }
+        val pid = header.indexOfFirst { it.equals("PID", true) }
+        val name = header.indexOfFirst { it.equals("NAME", true) }
+        if (uid < 0 || pid < 0 || name < 0) return null
+        return PsColumns(uid, pid, name)
+    }
+
     fun processes(lines: List<String>, uid: Int): List<String>? {
         val rows = lines.filter { it.isNotBlank() }.map { it.trim().split(whitespace) }
-        if (rows.firstOrNull() != listOf("UID", "PID", "NAME")) return null
+        val header = rows.firstOrNull() ?: return null
+        val cols = psColumns(header) ?: return null
         val result = mutableListOf<String>()
         for (fields in rows.drop(1)) {
-            if (fields.size != 3) return null
-            val rowUid = fields[0].toIntOrNull() ?: return null
-            if (fields[1].toIntOrNull() == null) return null
-            if (rowUid == uid && gmsProcessName(fields[2])) result += fields[2]
+            if (fields.size <= maxOf(cols.uid, cols.pid, cols.name)) return null
+            val rowUid = fields[cols.uid].toIntOrNull() ?: return null
+            if (fields[cols.pid].toIntOrNull() == null) return null
+            val name = fields.drop(cols.name).joinToString(" ")
+            if (rowUid == uid && gmsProcessName(name)) result += name
         }
         return result.distinct()
     }
 
-    /** 覆盖所有用户的 GMS 进程行：`UID PID NAME`，按用户段标注。 */
+    /** 覆盖所有用户的 GMS 进程行，按用户段标注。 */
     fun allGmsProcesses(lines: List<String>): List<String>? {
         val rows = lines.filter { it.isNotBlank() }.map { it.trim().split(whitespace) }
-        if (rows.firstOrNull() != listOf("UID", "PID", "NAME")) return null
+        val header = rows.firstOrNull() ?: return null
+        val cols = psColumns(header) ?: return null
         val result = mutableListOf<String>()
         for (fields in rows.drop(1)) {
-            if (fields.size != 3) return null
-            val rowUid = fields[0].toIntOrNull() ?: return null
-            if (fields[1].toIntOrNull() == null) return null
-            if (isAppUid(rowUid) && gmsProcessName(fields[2])) {
-                result += "${fields[2]}（uid=$rowUid, pid=${fields[1]}）"
+            if (fields.size <= maxOf(cols.uid, cols.pid, cols.name)) return null
+            val rowUid = fields[cols.uid].toIntOrNull() ?: return null
+            val pid = fields[cols.pid].toIntOrNull() ?: return null
+            val name = fields.drop(cols.name).joinToString(" ")
+            if (isAppUid(rowUid) && gmsProcessName(name)) {
+                result += "$name（uid=$rowUid, pid=$pid）"
             }
         }
         return result.distinct()
