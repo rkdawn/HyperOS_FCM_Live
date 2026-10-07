@@ -107,12 +107,15 @@ internal object RootDiagnosticsReader {
             """.trimIndent())
             evidence += paths
             val allowed = Regex("/data/adb/(?:lspd|lsposed)/log/modules[A-Za-z0-9_.:+-]*\\.log")
-            val candidates = paths.lines.filter { allowed.matches(it) }.distinct().sortedDescending().take(3)
+            // 7 天统计需要覆盖多份历史日志；LSPosed 按开机/轮转滚动文件，
+            // 取最近 20 份、每份尾部 3000 行。尾部足够：推送门控行分散在文件中，
+            // 但 20 份 × 3000 行的窗口在正常日志量下能覆盖数天的记录。
+            val candidates = paths.lines.filter { allowed.matches(it) }.distinct().sortedDescending().take(20)
             val records = mutableListOf<ModuleLogParser.Line>()
             val sources = mutableListOf<String>()
             var readable = false
             for (path in candidates) {
-                val part = read(shell, path, "tail -n 2000 '$path'")
+                val part = read(shell, path, "tail -n 3000 '$path'")
                 evidence += part
                 if (part.ok) {
                     readable = true

@@ -152,6 +152,60 @@ class DiagnosticsParserTest {
         assertNull(DiagnosticsParser.processes(listOf("USER PID PPID VSZ"), 10133))
     }
 
+    @Test fun windowStatsSplitByTimeAndCountGates() {
+        fun line(hourAgo: Long, message: String): ModuleLogParser.Line {
+            // stamp 必须是完整 "yyyy-MM-dd HH:mm:ss.SSS"（epochMillis 要求 >=23 字符）；
+            // raw 含时间戳，模拟 parseAll 的真实产出——gateCounts 按 raw 去重。
+            val stamp = java.time.LocalDateTime.of(2026, 10, 7, 12, 0, 0)
+                .minusHours(hourAgo).format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))
+            val raw = "$stamp  1000:  123:  456 I/LSPosedFramework ] $message"
+            return ModuleLogParser.Line(stamp, stamp.substringAfter(' ').substringBefore('.'), "I", message, raw)
+        }
+        val lines = listOf(
+            line(2, "fcm-gate: pkg=com.tencent.mm caller=10133"),
+            line(5, "fcm-gate: pkg=com.tencent.mm caller=10133"),
+            line(30, "fcm-gate: pkg=com.github.android caller=10133"),
+            line(50, "fcm-gate: pkg=com.tencent.mm caller=10133"),
+            line(100, "userTable: GMS current bgControl=noRestrict"),
+            line(100, "10-07 01:00:00.000 123 456 I HyperGreeze: no year"))
+        // nowMs 取 2026-10-07 12:00:00，让"24 小时"窗口覆盖 hourAgo<24 的记录。
+        val now = java.time.LocalDateTime.of(2026, 10, 7, 12, 0, 0)
+            .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val stats = DiagnosticsParser.windowStats(lines, now).associateBy { it.windowLabel }
+        val day = stats.getValue("24 小时")
+        assertEquals(2, day.totalGates)
+        assertEquals(1, day.gateRecords.size)
+        assertEquals(mapOf("com.tencent.mm" to 2), day.gateRecords)
+        assertEquals(1, day.coveredDays)
+        val three = stats.getValue("3 天")
+        // 3 天窗口 cutoff=10-04 12:00：2h/5h(10-07)、30h(10-06)、50h(10-05) 全在内。
+        assertEquals(4, three.totalGates)
+        assertEquals(2, three.gateRecords.size)
+        assertEquals(3, three.coveredDays)
+        val week = stats.getValue("7 天")
+        assertEquals(4, week.totalGates)
+        // 10-07/10-06/10-05 三天 gate + 10-03 的 userTable 行 = 4 天。
+        assertEquals(4, week.coveredDays)
+        // 无年份的 logcat 行不参与统计；动作分类不含门控行。
+        assertFalse(week.actionCounts.containsKey("推送放行"))
+        assertEquals(1, week.actionCounts["例行确认省电配置"])
+    }
+
+    @Test fun windowStatsEmptyWhenNoTimestampedLines() {
+        val noTime = listOf(ModuleLogParser.Line("10-07 01:00:00.000", "01:00:00", "I", "x", "x"))
+        assertTrue(DiagnosticsParser.windowStats(noTime, 0L).isEmpty())
+        assertTrue(DiagnosticsParser.windowStats(emptyList(), 0L).isEmpty())
+    }
+
+    @Test fun describeActionBucketsRoutineAndRepairWork() {
+        assertEquals("例行确认省电配置", DiagnosticsParser.describeAction("userTable: GMS current bgControl=noRestrict"))
+        assertEquals("改写省电配置", DiagnosticsParser.describeAction("userTable: update miuiAuto -> noRestrict count=1"))
+        assertEquals("安装系统钩子", DiagnosticsParser.describeAction("P1: isAllowBroadcast hooked"))
+        assertEquals("维护 Doze 白名单", DiagnosticsParser.describeAction("doze-wl-sentinel: GMS missing from doze whitelist, injected #1"))
+        assertEquals("闹钟放行观察", DiagnosticsParser.describeAction("checkAlarmIsAllowedSend: GMS alarm allowed by ROM"))
+        assertEquals("其他运行记录", DiagnosticsParser.describeAction("something unknown"))
+    }
+
     @Test fun socketOverviewUsesTheSameSnapshotAsDetails() {
         val sockets = DiagnosticsParser.sockets(listOf(header, socket("0100007F:146C")), 10133)
         val sample = GmsSample(10133, "test", emptyList(), sockets, null, "boot", 0,

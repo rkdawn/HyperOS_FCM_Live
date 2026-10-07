@@ -343,12 +343,16 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }
             .getOrNull()?.let { "${it.versionName} / build ${it.longVersionCode}" } ?: "版本未知"
     }
+    // 时间窗口统计（24 小时 / 3 天 / 7 天）：在组合层算好供列表展示。
+    val windowStats = remember(log) {
+        DiagnosticsParser.windowStats(log?.lines.orEmpty(), System.currentTimeMillis())
+    }
     // 模块活动聚合：在组合层算好，LazyListScope 里不能调用 remember。
     val eventBuckets = remember(log) {
         log?.lines.orEmpty().takeLast(200)
-            .groupBy { explainModuleEvent(it) }
+            .groupBy { DiagnosticsParser.describeAction(it.message) }
             .map { (explain, lines) ->
-                EventBucket(explain, lines.size, lines.maxOf { it.stamp }, lines.map { it.raw })
+                EventBucket(explainModuleEvent(lines.first()), lines.size, lines.maxOf { it.stamp }, lines.map { it.raw })
             }.sortedByDescending { it.count }
     }
     val bound = Prefs.remote() != null
@@ -374,6 +378,13 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
                     "本段首次观察到候选连接至今=${it.since?.let { since -> "${(it.at - since) / 1000} 秒" } ?: "本次未观察到"}。")
             } ?: appendLine("有效采样不足，未知。")
             appendLine("仅页面内手动采样；间隔超过 60 秒、缺测或重启即重建观察段，0 次不等于一直在线。")
+            appendLine("--- 时间窗口统计 ---")
+            windowStats.forEach { ws ->
+                appendLine("${ws.windowLabel}：推送放行 ${ws.totalGates} 次（${ws.gateRecords.entries.take(5)
+                    .joinToString("，") { "${it.key}×${it.value}" }}）；覆盖 ${ws.coveredDays} 天；" +
+                    "动作分布=${ws.actionCounts.entries.sortedByDescending { it.value }.take(5)
+                        .joinToString("，") { "${it.key}×${it.value}" }}")
+            }
             appendLine("--- 最近活动解释（最多 40 条）---")
             log?.lines.orEmpty().takeLast(40).forEach { appendLine("${it.stamp}：${explainModuleEvent(it)}") }
             appendLine("--- 原始依据 ---")
@@ -448,6 +459,21 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
                         Verdict.OK)
                 } else {
                     DetailCard(app.label, "声明支持推送；这几小时的日志里没有它的记录，通常就是期间没收到推送，不是故障。\n${app.pkg}")
+                }
+            }
+            item("section-windows") { Heading("推送统计（24 小时 / 3 天 / 7 天）") }
+            if (windowStats.isEmpty()) {
+                item("windows-empty") { Note("日志里没有带完整时间戳的记录，无法按时间窗口统计。可能是日志被清理过，或读取范围不够。") }
+            } else {
+                items(windowStats, key = { it.windowLabel }) { ws ->
+                    val gatePart = if (ws.totalGates == 0) "没有观察到推送到达的记录"
+                        else "观察到 ${ws.totalGates} 次推送放行，涉及 ${ws.gateRecords.size} 个应用"
+                    val topAction = ws.actionCounts.entries.maxByOrNull { it.value }
+                    val actionPart = topAction?.let { "，模块最频繁的动作是「${it.key}」（${it.value} 次）" } ?: ""
+                    DetailCard(ws.windowLabel,
+                        "$gatePart$actionPart。\n统计覆盖 ${ws.coveredDays} 天的日志记录" +
+                            (ws.lastStamp?.let { "，最新记录 ${it.substringBefore('.')}" } ?: "") +
+                            "。日志会随开关机轮转，更早的历史无法统计。")
                 }
             }
             item("section-events") { Heading("模块在干什么") }

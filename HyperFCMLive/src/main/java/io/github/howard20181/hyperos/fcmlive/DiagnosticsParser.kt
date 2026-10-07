@@ -211,6 +211,74 @@ internal object DiagnosticsParser {
         val since: Long?, val observedLosses: Int
     )
 
+    /**
+     * 时间窗口统计：把多份日志的记录按 24 小时 / 3 天 / 7 天三个窗口汇总。
+     * 只统计带完整年份时间戳的记录（无年份的 logcat 回退无法可靠归窗）。
+     * coveredDays 是窗口内有实际记录的天数，说明统计的覆盖面。
+     */
+    data class WindowStats(
+        val windowLabel: String,
+        val coveredDays: Int,
+        val totalGates: Int,
+        val gateRecords: Map<String, Int>,
+        val actionCounts: Map<String, Int>,
+        val firstStamp: String?,
+        val lastStamp: String?
+    )
+
+    private val WINDOWS = listOf("24 小时" to 1L, "3 天" to 3L, "7 天" to 7L)
+
+    fun windowStats(lines: List<ModuleLogParser.Line>, nowMs: Long): List<WindowStats> {
+            // 只保留能解析出绝对时间的记录；epochMillis 对带年份的行返回毫秒。
+            val timed = lines.mapNotNull { line ->
+                val epoch = ModuleLogParser.epochMillis(line) ?: return@mapNotNull null
+                line to epoch
+            }
+            if (timed.isEmpty()) return emptyList()
+            val maxEpoch = timed.maxOf { it.second }
+            // 基准用最新记录的时间而不是当前时钟：旧日志离线分析时不会整窗落空。
+            val reference = maxOf(maxEpoch, nowMs)
+            return WINDOWS.map { (label, days) ->
+                val cutoff = reference - days * 24 * 3600_000L
+                val inWindow = timed.filter { it.second >= cutoff }.map { it.first }
+                val gates = ModuleLogParser.gateCounts(inWindow)
+                val dayStamps = inWindow.map { it.stamp.take(10) }.distinct()
+                WindowStats(
+                    windowLabel = label,
+                    coveredDays = dayStamps.size,
+                    totalGates = gates.values.sumOf { it.count },
+                    gateRecords = gates.mapValues { it.value.count },
+                    actionCounts = inWindow
+                        .filter { ModuleLogParser.gatePackage(it.message) == null }
+                        .groupBy { describeAction(it.message) }
+                        .mapValues { it.value.size },
+                    firstStamp = inWindow.minOfOrNull { it.stamp },
+                    lastStamp = inWindow.maxOfOrNull { it.stamp }
+                )
+            }
+    }
+
+    /** 把一条日志消息归入一个人话动作类别（与页面解释规则保持一致）。 */
+    internal fun describeAction(message: String): String = when {
+        message.startsWith("userTable: ensure") || message.startsWith("userTable: GMS current") -> "例行确认省电配置"
+        message.startsWith("userTable: update") || message.startsWith("userTable: insert") -> "改写省电配置"
+        message.contains(" hooked") || message.startsWith("Allowlist receiver installed") -> "安装系统钩子"
+        message.startsWith("doze-wl-sentinel") -> "维护 Doze 白名单"
+        message.startsWith("P3: rewrote") -> "改写省电场景"
+        message.startsWith("P1:") || message.startsWith("P0:") || message.startsWith("P2:") -> "安装系统钩子"
+        message.startsWith("MILLET_NO_RESTRICT_APP") -> "修复免限名单"
+        message.startsWith("checkAlarmIsAllowedSend") -> "闹钟放行观察"
+        message.startsWith("wake-path probe") -> "唤醒路径观察"
+        message.startsWith("gms probe") -> "流量探针采样"
+        message.startsWith("standby-firewall") -> "拦截待机防火墙"
+        message.startsWith("Hot reload") -> "热重载"
+        message.startsWith("HyperFCMLive active in") -> "安装摘要"
+        message.startsWith("allowlist loaded") -> "读取名单"
+        message.startsWith("sleep-mode") -> "睡眠模式保活"
+        message.startsWith("P4: recovery") -> "请求重连"
+        else -> "其他运行记录"
+    }
+
     fun observe(previous: Observation?, boot: String?, at: Long, online: Boolean?): Observation? {
         if (boot.isNullOrBlank() || online == null) return null
         val adjacent = previous != null && previous.boot == boot && at >= previous.at && at - previous.at <= 60_000L
