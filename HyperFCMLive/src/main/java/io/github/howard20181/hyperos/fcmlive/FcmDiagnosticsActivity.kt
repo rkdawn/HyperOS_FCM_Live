@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -278,6 +279,9 @@ internal fun explainModuleEvent(line: ModuleLogParser.Line): String {
 
 private data class ScreenData(val basic: BasicDiagnostics, val snapshot: RootDiagnosticsReader.Snapshot?)
 
+/** 模块活动聚合桶：同一类动作的次数、最近时间与原始行。 */
+private data class EventBucket(val explain: String, val count: Int, val last: String, val raws: List<String>)
+
 @Composable
 private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit, onExport: (String) -> Unit) {
     val context = LocalContext.current.applicationContext
@@ -323,6 +327,14 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }
             .getOrNull()?.let { "${it.versionName} / build ${it.longVersionCode}" } ?: "版本未知"
     }
+    // 模块活动聚合：在组合层算好，LazyListScope 里不能调用 remember。
+    val eventBuckets = remember(log) {
+        log?.lines.orEmpty().takeLast(200)
+            .groupBy { explainModuleEvent(it) }
+            .map { (explain, lines) ->
+                EventBucket(explain, lines.size, lines.maxOf { it.stamp }, lines.map { it.raw })
+            }.sortedByDescending { it.count }
+    }
     val bound = Prefs.remote() != null
     val report = remember(current, error, versionLabel, observation, bound) {
         buildString {
@@ -365,15 +377,16 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
                 bottom = padding.calculateBottomPadding() + 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (busy) item("progress") { LinearProgressIndicator(Modifier.fillMaxWidth()) }
             item("root-button") {
-                // contentPadding 与 Note 的 8dp 对齐，否则按钮文字比下方说明凸出一截。
-                TextButton(enabled = !busy, onClick = {
-                    rootRequested = true
-                    scope.launch { reload(true) }
-                }, contentPadding = PaddingValues(horizontal = 8.dp)) {
-                    Text(if (rootRequested) "重新进行 Root 检测" else "以 Root 检测",
-                        style = MaterialTheme.typography.labelMedium)
-                }
-                Note("只读检查进程、网络与模块日志；不自动修复或更改系统设置。")
+                // 通栏实底按钮：一眼可点的主要操作，不再与正文文字混淆。
+                Button(
+                    enabled = !busy,
+                    onClick = {
+                        rootRequested = true
+                        scope.launch { reload(true) }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text(if (rootRequested) "重新进行 Root 检测" else "以 Root 检测开始全面检查") }
+                Note("只读检查推送连接、系统限制与模块日志；不自动修复、不更改任何系统设置。已授权的手机不会重复弹窗。")
             }
             error?.let { item("error") { Note(it) } }
             item("section-status") { Heading("状态与处理建议") }
@@ -406,29 +419,61 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
                         "\n仅统计本页面手动采样；间隔超过 60 秒、缺测或重启即重建观察段。0 次不等于一直在线。")
             }
             item("section-apps") { Heading("哪些应用支持 FCM") }
-            item("app-help") { Note(current?.basic?.warning ?: "正在读取应用列表…")
-                Note("FCM 通常由 GMS 代持共享长连接，没有每个应用独立的 FCM 连接时长。下方记录为日志片段中的广播放行次数，不是通知或消息数量。") }
-            if (apps.isEmpty()) item("app-empty") { Note("当前未识别到声明 FCM 的应用；请确认应用列表权限。") }
-            items(apps, key = { "app-${it.pkg}" }) { app ->
-                val count = counts[app.pkg]
-                val inAllowlist = current?.basic?.allowlist?.contains(app.pkg) == true
-                DetailCard(app.label, "${app.pkg}\n${if (app.declared) "声明了 FCM 组件" else "日志中观察到广播放行"}" +
-                    (count?.let { "\n放行记录 ${it.count} 条 · 最近 ${it.lastStamp}" } ?: run {
-                        // 严格模式下未勾选的应用门控不插手，"没有放行记录"是设计行为。
-                        if (current?.basic?.strictMode == true && !inAllowlist)
-                            "\n严格模式下未勾选：门控不接管该应用，没有放行记录属正常"
-                        else "\n当前日志片段中没有放行记录，不代表从未收到推送"
-                    }))
+            item("app-help") { Note("FCM 的推送由谷歌服务代持一条共享长连接，没有每个应用独立的连接，所以只能按“有没有观察到推送到达”分组，而不是显示每个应用通没通。") }
+            // 有放行记录 = 近期确实观察到推送到达；其余是声明支持但本期无记录。
+            val withTraffic = apps.filter { counts[it.pkg] != null }
+            val declaredOnly = apps.filter { counts[it.pkg] == null }
+            if (withTraffic.isNotEmpty()) {
+                item("apps-traffic-head") { SubHeading("近期观察到推送到达（${withTraffic.size} 个）") }
+                items(withTraffic, key = { "app-${it.pkg}" }) { app ->
+                    val count = counts[app.pkg]!!
+                    DetailCard(app.label, "推送到达 ${count.count} 次，最近 ${count.lastStamp}\n${app.pkg}",
+                        Verdict.OK)
+                }
+            } else {
+                item("apps-traffic-empty") { Note("本页日志片段（约几小时）内没有观察到任何应用的推送到达记录。期间如果手机亮屏且网络正常，推送通常不走被拦截的路径，属常见现象。") }
             }
-            item("section-events") { Heading("最近模块活动") }
-            if (log?.lines.isNullOrEmpty()) item("log-empty") { Note("当前没有可解释的本模块记录。日志不可读、路径不兼容或片段为空都可能造成这一结果，详情请导出报告。") }
-            items(log?.lines.orEmpty().takeLast(40).reversed(), key = { "event-${it.raw}" }) { line ->
-                var expanded by remember(line.raw) { mutableStateOf(false) }
-                GroupRow(first = true, last = true, onClick = { expanded = !expanded }) {
-                    Text(line.stamp, style = MaterialTheme.typography.labelMedium)
-                    Text(explainModuleEvent(line), style = MaterialTheme.typography.bodyMedium)
-                    if (expanded) Text(line.raw, style = MaterialTheme.typography.bodySmall)
-                    else Text("点按查看原始依据", style = MaterialTheme.typography.labelSmall)
+            if (declaredOnly.isNotEmpty()) {
+                item("apps-declared-head") { SubHeading("声明支持 FCM，本期未见记录（${declaredOnly.size} 个）") }
+                items(declaredOnly, key = { "app-${it.pkg}" }) { app ->
+                    val inAllowlist = current?.basic?.allowlist?.contains(app.pkg) == true
+                    val why = when {
+                        // 严格模式下未勾选的应用门控不插手，"没有记录"是设计行为。
+                        current?.basic?.strictMode == true && !inAllowlist -> "严格模式下未勾选：模块不接管该应用"
+                        else -> "期间可能没收到推送，或推送未经过需放行的路径；不代表推送功能失效"
+                    }
+                    DetailCard(app.label, "$why\n${app.pkg}")
+                }
+            }
+            item("section-events") { Heading("模块在干什么") }
+            item("events-help") { Note("模块的运行记录按类型汇总在这里。每类显示次数和最近时间；点开一条可看原始日志。") }
+            if (eventBuckets.isEmpty()) {
+                item("log-empty") { Note("当前没有模块记录。日志不可读、路径不兼容或片段为空都可能造成这一结果，详情可导出报告。") }
+            } else {
+                // 按解释文案聚合：同一类动作合成一条（次数 + 最近时间），不再逐条刷屏。
+                items(eventBuckets, key = { it.explain }) { bucket ->
+                    var expanded by remember(bucket.explain) { mutableStateOf(false) }
+                    GroupRow(first = true, last = true, onClick = { expanded = !expanded }) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(bucket.explain, modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodyMedium)
+                            Spacer(Modifier.width(12.dp))
+                            Text("${bucket.count} 次", style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Text("最近 ${bucket.last.substringBefore('.')}", style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (expanded) {
+                            // 只展开最近 3 条原文，更多数据走导出报告。
+                            bucket.raws.takeLast(3).forEach { raw ->
+                                Text(raw, style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.outline)
+                            }
+                            if (bucket.raws.size > 3) Text("（其余 ${bucket.raws.size - 3} 条见导出报告）",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline)
+                        }
+                    }
                 }
             }
             item("actions") {
@@ -443,6 +488,11 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
 @Composable
 private fun Heading(text: String) = Text(text, modifier = Modifier.padding(top = 16.dp, start = 8.dp, bottom = 4.dp),
     style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+
+/** 分组小标题：比 Heading 更贴近内容，用于列表内分组。 */
+@Composable
+private fun SubHeading(text: String) = Text(text, modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+    style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
 @Composable
 private fun Note(text: String) = Text(text, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
