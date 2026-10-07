@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -384,8 +385,12 @@ private fun FcmDiagnosticsScreen(onBack: () -> Unit, onOpenOfficial: () -> Unit,
                         rootRequested = true
                         scope.launch { reload(true) }
                     },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text(if (rootRequested) "重新进行 Root 检测" else "以 Root 检测开始全面检查") }
+                    modifier = Modifier.fillMaxWidth().height(48.dp)
+                ) {
+                    // 主操作与下方卡片标题同级（titleMedium），比正文更醒目。
+                    Text(if (rootRequested) "重新进行 Root 检测" else "以 Root 检测开始全面检查",
+                        style = MaterialTheme.typography.titleMedium)
+                }
                 Note("只读检查推送连接、系统限制与模块日志；不自动修复、不更改任何系统设置。已授权的手机不会重复弹窗。")
             }
             error?.let { item("error") { Note(it) } }
