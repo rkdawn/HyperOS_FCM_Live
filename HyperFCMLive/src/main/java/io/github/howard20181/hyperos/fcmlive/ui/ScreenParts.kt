@@ -249,7 +249,6 @@ fun MenuItemRow(
     checkable: Boolean? = null,
     minWidth: Dp = MENU_MIN_WIDTH,
     arrangement: Arrangement.Horizontal = Arrangement.Start,
-    leading: (@Composable () -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null
 ) {
     val shape = LocalAppShapes.current.menuItem
@@ -308,9 +307,6 @@ fun MenuItemRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = arrangement
         ) {
-            if (leading != null) {
-                leading()
-            }
             Text(
                 text = label,
                 // Paired with the plate above; see [MenuItemRow]'s note. It

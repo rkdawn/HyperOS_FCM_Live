@@ -14,7 +14,6 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -271,9 +270,7 @@ class MainActivity : AppCompatActivity() {
                         onToggleShowFcmOnly = { toggleOverflowShowFcmOnly() },
                         onToggleExcludeMiPush = { toggleOverflowExcludeMiPush() },
                         onToggleStrictMode = { toggleOverflowStrictMode() },
-                        onDiagnostics = {
-                            startActivity(Intent(this, FcmDiagnosticsActivity::class.java))
-                        }
+                        onDiagnostics = { openFcmDiagnostics() }
                     ),
                     // The field reads the query from this state, so no view
                     // hand-off is needed: whatever currentQuery holds when the
@@ -546,10 +543,7 @@ class MainActivity : AppCompatActivity() {
             ThemeSupport.reapplyWindow(this)
             appliedPalette = palette
         }
-        // No rescan here. The refresh gesture is the only manual entry, and
-        // the stock behaviour covers the rest: the allowlist re-syncs through
-        // the Xposed service callback and after every list edit, so the list
-        // on return from settings is already current without a scan.
+        // 返回设置页仅重应用主题，不新增扫描；其余加载触发保留作者原有逻辑。
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -876,24 +870,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openFcmDiagnostics() {
-        val intent = Intent()
-        intent.setClassName("com.google.android.gms", "com.google.android.gms.gcm.GcmDiagnostics")
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        try {
-            startActivity(intent)
-        } catch (t: Throwable) {
-            try {
-                val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
-                fallback.data = Uri.parse("package:com.google.android.gms")
-                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(fallback)
-            } catch (t2: Throwable) {
-                showMessage(getString(R.string.fcm_diagnostics_not_found))
-            }
-        }
+        startActivity(Intent(this, FcmDiagnosticsActivity::class.java))
     }
 
-    /** Launcher shortcut entry: open GMS diagnostics immediately when asked. */
+    /** 菜单与桌面快捷方式统一进入诊断页，GMS 官方诊断仍保留在页内。 */
     private fun handleShortcutIntent(intent: Intent?) {
         if (intent?.action == ACTION_FCM_DIAGNOSTICS) {
             openFcmDiagnostics()

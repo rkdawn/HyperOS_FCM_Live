@@ -775,15 +775,11 @@ class Hooker : XposedModule() {
                             if (!callerPkgIsGms) {
                                 broadcastGateAllowedByUidCount++
                             }
-                            // Per-delivery line (NOT one-shot): the diagnostics
-                            // page aggregates these into per-app push counts.
-                            // One INFO line per delivered push is affordable —
-                            // c2dm arrivals are tens per app per day, not per
-                            // second — and the "delivery:" prefix is the stable
-                            // contract the parser greps for.
+                            // 每次门控放行单独记录，供诊断页按应用展示近期记录。
+                            // 这里只证明模块返回 true，不代表消息送达或通知展示。
                             log(
                                 Log.INFO, TAG,
-                                "delivery: pkg=$calleePkgName caller=${callerPkg ?: callerUid ?: "?"}"
+                                "fcm-gate: pkg=$calleePkgName caller=${callerPkg ?: callerUid ?: "?"}"
                             )
                             if (!broadcastGateAllowedLogged) {
                                 broadcastGateAllowedLogged = true

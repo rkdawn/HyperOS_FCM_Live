@@ -46,14 +46,9 @@ android {
         // with it the whole pre-edge-to-edge window handling path.
         minSdkVersion 35
         targetSdkVersion 37
-        // Fixed (bumped by hand each release) so LSPosed update checks never treat
-        // this fork as older than upstream builds that inherit a low jgit commitCount.
-        // Local test build: one minor above the official 3.6.2 so the in-app update
-        // check (tag = versionName.versionCode, pure-numeric compare, non-numeric
-        // segments parse as 0) sees 3.6.3.43 > 3.6.2.42 and stays quiet.
-        // Do NOT use a letter suffix here ("3.6.2-deopt.1" parses "deopt" as 0 and
-        // reads as older than the official build forever).
-        versionCode 43
+        // 本地验证包使用独立版本号，避免多份不同 APK 共用同一版本。
+        // 版本名保持纯数字，兼容现有更新器的逐段比较。
+        versionCode 44
         versionName "3.6.3"
 
         // HyperOS modules ship arm64 only; drop armv7a / x86 / x86_64 natives.
@@ -170,7 +165,10 @@ dependencies {
     // not needed at all — not even the core one. material3 stopped pulling them
     // in transitively at 1.4.0, and nothing here references `Icons.*` any more.
     implementation 'androidx.compose.ui:ui-tooling-preview'
-    debugImplementation 'androidx.compose.ui:ui-tooling'
+    // 离线 JVM 测试不需要运行时布局检查器；默认 debug 构建仍保留。
+    if (!project.hasProperty('skipUiTooling')) {
+        debugImplementation 'androidx.compose.ui:ui-tooling'
+    }
     compileOnly 'io.github.libxposed:api:102.0.0'
     implementation 'io.github.libxposed:service:102.0.0'
     // Compile-time hidden-API signatures (not packaged in the APK).

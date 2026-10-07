@@ -445,6 +445,7 @@ private val DEPS = arrayOf(
         "Apache License 2.0",
         "https://github.com/Kotlin/kotlinx.serialization"
     ),
+    arrayOf("libsu Core", "6.0.0", "Apache License 2.0", "https://github.com/topjohnwu/libsu"),
     arrayOf("libxposed API", "102.0.0", "Apache License 2.0", "https://github.com/libxposed/api"),
     arrayOf("libxposed Interface", "102.0.0", "Apache License 2.0", "https://github.com/libxposed"),
     arrayOf("libxposed Service", "102.0.0", "Apache License 2.0", "https://github.com/libxposed/service"),
