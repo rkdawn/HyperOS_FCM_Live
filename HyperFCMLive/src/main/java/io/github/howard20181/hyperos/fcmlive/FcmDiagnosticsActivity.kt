@@ -50,33 +50,92 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class FcmDiagnosticsActivity : AppCompatActivity() {
-    private val pendingReportFile get() = java.io.File(cacheDir, "pending-fcm-diagnostics.txt")
+    private var exportId = java.util.UUID.randomUUID().toString()
+    private var exportInProgress by mutableStateOf(false)
+    private var exportPickerOpen = false
+    private val pendingReportFile get() = java.io.File(cacheDir, "pending-fcm-$exportId.txt")
     private val exportReport = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
-        if (uri != null) lifecycleScope.launch {
-            val saved = withContext(Dispatchers.IO) {
-                runCatching {
-                    val report = pendingReportFile.readText(Charsets.UTF_8)
-                    check(report.isNotBlank())
-                    contentResolver.openOutputStream(uri, "wt")?.bufferedWriter(Charsets.UTF_8)?.use { it.write(report) }
-                        ?: error("无法打开文件")
-                }.isSuccess
+        exportPickerOpen = false
+        val stagedFile = pendingReportFile
+        if (uri == null) {
+            exportInProgress = false
+            lifecycleScope.launch { discardStagedReport(stagedFile) }
+        } else lifecycleScope.launch {
+            try {
+                val saved = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val report = stagedFile.readText(Charsets.UTF_8)
+                        check(report.isNotBlank())
+                        contentResolver.openOutputStream(uri, "wt")?.bufferedWriter(Charsets.UTF_8)?.use { it.write(report) }
+                            ?: error("无法打开文件")
+                    }.isSuccess
+                }
+                Toast.makeText(this@FcmDiagnosticsActivity,
+                    if (saved) "报告已保存。在文件管理器里找到刚保存的 txt 文件即可分享。" else "保存失败，请重新选择位置导出。",
+                    Toast.LENGTH_LONG).show()
+            } finally {
+                discardStagedReport(stagedFile)
+                exportInProgress = false
             }
-            Toast.makeText(this@FcmDiagnosticsActivity, if (saved) "报告已保存" else "报告保存失败", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private suspend fun discardStagedReport(file: java.io.File) {
+        withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+            runCatching { file.delete() }
+            ExportStaging.release(file)
+        }
+    }
+
+    private fun prepareExport(report: String) {
+        if (exportInProgress) return
+        exportInProgress = true
+        exportId = java.util.UUID.randomUUID().toString()
+        val stagedFile = pendingReportFile
+        ExportStaging.hold(stagedFile)
+        lifecycleScope.launch {
+            var handedToPicker = false
+            try {
+                withContext(Dispatchers.IO) { stagedFile.writeText(report, Charsets.UTF_8) }
+                val time = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
+                exportPickerOpen = true
+                exportReport.launch("FCM诊断-$time.txt")
+                handedToPicker = true
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) {
+                exportPickerOpen = false
+                exportInProgress = false
+                Toast.makeText(this@FcmDiagnosticsActivity, "无法打开保存窗口，请稍后重试。", Toast.LENGTH_LONG).show()
+            } finally {
+                if (!handedToPicker) discardStagedReport(stagedFile)
+            }
         }
     }
 
     override fun attachBaseContext(newBase: Context) = super.attachBaseContext(ThemeSupport.attach(newBase))
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("diagnostics_export_id", exportId)
+        outState.putBoolean("diagnostics_export_picker", exportPickerOpen)
+        super.onSaveInstanceState(outState)
+    }
+    override fun onDestroy() {
+        if (isFinishing) ExportStaging.release(pendingReportFile)
+        super.onDestroy()
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        savedInstanceState?.getString("diagnostics_export_id")?.let {
+            if (runCatching { java.util.UUID.fromString(it).toString() == it }.getOrDefault(false)) exportId = it
+        }
+        exportPickerOpen = savedInstanceState?.getBoolean("diagnostics_export_picker") == true
+        exportInProgress = exportPickerOpen
+        if (exportPickerOpen) ExportStaging.hold(pendingReportFile)
+        lifecycleScope.launch(Dispatchers.IO) { ExportStaging.removeExpired(cacheDir, System.currentTimeMillis()) }
         ThemeSupport.onCreate(this)
         setContentView(ComposeView(this).apply { setContent {
-            HyperFCMLiveTheme { DiagnosticsScreen(onBack = { finish() }, onExport = { report ->
-                lifecycleScope.launch {
-                    val saved = withContext(Dispatchers.IO) { runCatching { pendingReportFile.writeText(report, Charsets.UTF_8) }.isSuccess }
-                    if (saved) exportReport.launch("HyperFCMLive-diagnostics.txt")
-                    else Toast.makeText(this@FcmDiagnosticsActivity, "无法暂存报告", Toast.LENGTH_SHORT).show()
-                }
-            }) }
+            HyperFCMLiveTheme {
+                DiagnosticsScreen(onBack = { finish() }, onExport = ::prepareExport, exporting = exportInProgress)
+            }
         } })
     }
 }
@@ -112,7 +171,7 @@ private fun basicDiagnostics(context: Context): BasicDiagnostics {
 }
 
 @Composable
-private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit) {
+private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit, exporting: Boolean) {
     val activity = LocalContext.current
     val context = activity.applicationContext
     val scope = rememberCoroutineScope()
@@ -160,18 +219,25 @@ private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit) {
         val now = sample?.nowMs ?: System.currentTimeMillis()
         log?.lines.orEmpty().filter { ModuleLogParser.epochMillis(it)?.let { time -> time in (now - days * 86_400_000)..now } == true }
     }
-    val groups = remember(recent) { recent.groupBy {
-        if (it.level in setOf("E", "F") || it.message.contains("failed", true)) "执行失败记录"
-        else DiagnosticsParser.describeAction(it.message)
-    }.entries.sortedWith(compareByDescending<Map.Entry<String, List<ModuleLogParser.Line>>> { it.key == "执行失败记录" }
-        .thenBy { it.key == "其他检查记录" }.thenByDescending { it.value.size }) }
+    val groups = remember(recent) { explainedLogGroups(recent) }
     val counts = remember(recent) { ModuleLogParser.gateCounts(recent) }
     val version = remember { UpdateChecker.localVersionTag(context) }
     val report = remember(data, actionResult, error, windows, bound) { buildString {
         appendLine("HyperFCMLive $version 诊断报告")
-        appendLine("连接只是采样；放行记录不是消息送达。历史仅包含已采集片段。")
+        appendLine("先看前面的检查结论和大白话解读。后面的原始数据留给排查者，不需要你逐行看懂。")
+        appendLine("注意：日志记录不等于收到通知；历史仅包含实际采集到的片段。")
         error?.let { appendLine(it) }
         actionResult?.let { appendLine("最近主动操作：$it") }
+        appendLine("一、先看检查结论")
+        primaryStatus(sample, log, bound).forEach { appendLine("${it.title}：${it.detail}") }
+        appendLine("二、日志大白话解读（最近 500 条记录按类型归类）")
+        val explanations = explainedLogGroups(log?.lines.orEmpty().takeLast(500))
+        if (explanations.isEmpty()) appendLine("暂时没有可解读的模块日志，不代表没有收到推送。")
+        explanations.forEach { group ->
+            appendLine("【${group.explanation.title}】${group.records.size} 条记录，最近 ${group.records.last().stamp}")
+            appendLine(group.explanation.text)
+        }
+        appendLine("三、排查明细（不需要逐行阅读）")
         statusItems(sample, log, bound).forEach { appendLine("${it.title} [${it.verdict.label}]：${it.detail}") }
         appendLine("--- 当前用户应用 ---")
         data?.basic?.warning?.let { appendLine(it) }
@@ -182,9 +248,7 @@ private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit) {
             w.gateRecords.forEach { (pkg, n) -> appendLine("  $pkg：$n 条放行记录（非送达次数）") }
             w.actionCounts.forEach { (label, n) -> appendLine("  $label：$n 条日志") }
         }
-        appendLine("--- 最近活动解释 ---")
-        log?.lines.orEmpty().takeLast(40).forEach { appendLine("${it.stamp} ${explainModuleEvent(it)}") }
-        appendLine("--- 原始依据 ---")
+        appendLine("四、原始依据（供排查使用，日志可能只是片段）")
         sample?.let { appendLine(it.raw) }
     } }
 
@@ -221,7 +285,10 @@ private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit) {
                             TextButton(enabled = !busy, onClick = { pendingAction = DiagnosticsActions.Action.REPAIR_MILLET }) { Text("补回防冻结名单") }
                         }
                     }
-                    TextButton(enabled = data != null && !busy, onClick = { onExport(report) }) { Text("导出排查报告") }
+                    TextButton(enabled = data != null && !busy && !exporting, onClick = { onExport(report) }) {
+                        Text(if (exporting) "正在导出…" else "导出排查报告（txt）")
+                    }
+                    Note("导出方法：点上面的按钮，选择“下载”等文件夹，再点保存。随后在文件管理器中找到 txt 文件即可分享。报告前面是大白话，后面保留排查原文。")
                 }
             }
             actionResult?.let { item("result") { DetailCard("操作结果", it) } }
@@ -244,17 +311,21 @@ private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit) {
                     Row(Modifier.fillMaxWidth()) { listOf("24 小时", "3 天", "7 天").forEach { label ->
                         TextButton(onClick = { selectedWindow = label }, modifier = Modifier.weight(1f)) { Text(if (label == selectedWindow) "✓ $label" else label) }
                     } }
-                    Note("只分析实际读到并保存的日志片段，无法保证覆盖整段时间；没有记录不等于没收到推送。")
-                    selectedStats?.let { Note("$selectedWindow：${it.totalGates} 条广播放行记录；在 ${it.coveredDays} 个日期留有记录。\n最早：${it.firstStamp ?: "无"}；最新：${it.lastStamp ?: "无"}") }
+                    Note("下面把模块的运行日志翻成大白话，帮你判断要不要操作。只分析实际采到的记录，没有记录不等于没收到通知。")
+                    selectedStats?.let {
+                        Note(if (it.totalGates == 0) "$selectedWindow 内，日志没有记到模块放行推送请求的过程，不能据此判断没收到消息。"
+                            else "$selectedWindow 内，有 ${it.totalGates} 条模块帮助放行推送请求的记录，不是收到通知的次数。")
+                        Note("目前只在 ${it.coveredDays} 个日期留有记录，不代表整段时间都监测到了。\n最早：${it.firstStamp ?: "无"}；最新：${it.lastStamp ?: "无"}")
+                    }
                     if (selectedStats == null) Note("尚无可按日期统计的记录。")
                 }
-                items(groups, key = { "event-${it.key}" }) { group ->
-                    var expanded by remember(group.key) { mutableStateOf(false) }
+                items(groups, key = { "event-${it.explanation.kind}" }) { group ->
+                    var expanded by remember(group.explanation.kind) { mutableStateOf(false) }
                     GroupRow(true, true, onClick = { expanded = !expanded }) {
-                        Text("${group.key} · ${group.value.size} 条日志", style = MaterialTheme.typography.titleMedium)
-                        Text(explainModuleEvent(group.value.last()), style = MaterialTheme.typography.bodyMedium)
-                        Text("最近 ${group.value.last().stamp} · 点按${if (expanded) "收起" else "查看原文"}", style = MaterialTheme.typography.labelMedium)
-                        if (expanded) group.value.takeLast(3).forEach { Text(it.raw, style = MaterialTheme.typography.bodySmall) }
+                        Text(group.explanation.title, style = MaterialTheme.typography.titleMedium)
+                        Text(group.explanation.text, style = MaterialTheme.typography.bodyMedium)
+                        Text("同类记录 ${group.records.size} 条 · 最近 ${group.records.last().stamp}\n点按${if (expanded) "收起" else "查看原始日志（可不看）"}", style = MaterialTheme.typography.labelMedium)
+                        if (expanded) group.records.takeLast(3).forEach { Text(it.raw, style = MaterialTheme.typography.bodySmall) }
                     }
                 }
             }

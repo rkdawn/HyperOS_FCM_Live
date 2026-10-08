@@ -101,22 +101,4 @@ internal fun overallSummary(sample: GmsSample?, log: LogRead?, bound: Boolean): 
         if (issues > 0) Verdict.ATTENTION else Verdict.INFO
 }
 
-internal fun explainModuleEvent(line: ModuleLogParser.Line): String {
-    val m = line.message
-    if (line.level in setOf("E", "F") || m.contains("failed", ignoreCase = true)) return "模块记录了执行失败；保留原文用于排查。"
-    if (ModuleLogParser.gatePackage(m) != null) return "模块放行了一次推送广播，不代表应用已经处理或展示通知。"
-    return when {
-        m.startsWith("gms probe") -> ModuleLogParser.trafficOf(m)?.let {
-            "谷歌服务${if (it.delta) "自上次采样" else "累计"}接收 ${it.rx}、发送 ${it.tx} 字节；不是推送消息数量。"
-        } ?: "流量探针状态记录，不用于判断消息是否送达。"
-        m.contains("GMS missing from doze whitelist") -> "模块向查询结果补入谷歌服务的省电豁免项；与免打扰模式无关。"
-        m.startsWith("userTable: update") -> "模块尝试调整谷歌服务省电配置，修改条数以原文为准。"
-        m.startsWith("userTable:") -> "读取或维护谷歌服务省电配置，是否有修改以原文为准。"
-        m.startsWith("P3: rewrote") -> "模块改写了一次谷歌服务省电场景。"
-        m.startsWith("standby-firewall:") -> "模块跳过了待机限网命令；日志有节流，记录条数不是实际执行总次数。"
-        m.startsWith("P4: recovery") -> "发出了重连请求，尚不能确认连接恢复。"
-        m.contains("DENIED") -> "系统拒绝了一次唤醒请求；仅凭调用方不能判定某个应用的 FCM 被拦。"
-        m.contains(" hooked") || m.startsWith("HyperFCMLive active in") -> "模块安装记录，不代表该功能之后一定触发。"
-        else -> "例行检查记录，不直接代表推送成功或失败。"
-    }
-}
+internal fun explainModuleEvent(line: ModuleLogParser.Line): String = interpretLogEvent(line).text
