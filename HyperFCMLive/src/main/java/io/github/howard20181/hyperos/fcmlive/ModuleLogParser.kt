@@ -1,7 +1,6 @@
 package io.github.howard20181.hyperos.fcmlive
 
 import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
 
 /** 同时识别 LSPosed 文件和 logcat；先核实模块身份，再解释消息。 */
 internal object ModuleLogParser {
@@ -19,7 +18,8 @@ internal object ModuleLogParser {
         val time: String,
         val level: String,
         val message: String,
-        val raw: String
+        val raw: String,
+        val process: String = ""
     )
 
     fun parse(raw: String): Line? {
@@ -33,6 +33,7 @@ internal object ModuleLogParser {
         val level = header.groupValues[1]
         val tag = header.groupValues[2].trim().substringBefore('(').trim()
         var body = header.groupValues[3]
+        var process = ""
         // API 102 常用 LSPosedFramework 标签，模块自己的 tag 在消息封套里。
         val moduleEnvelope = "[$MODULE_PACKAGE,$MODULE_TAG,"
         if (tag != MODULE_TAG) {
@@ -41,6 +42,7 @@ internal object ModuleLogParser {
             if (begin < 0) return null
             // 封套必须位于框架消息开头，不能把其他模块引用的日志文本算进来。
             val prefix = body.substring(0, begin).trim()
+            process = prefix.removeSurrounding("(", ")")
             if (prefix.isNotEmpty() && !Regex("\\([^\\[\\]\\r\\n()]*\\)").matches(prefix)) return null
             val end = body.indexOf(']', begin)
             if (end < 0) return null
@@ -48,7 +50,7 @@ internal object ModuleLogParser {
         }
         val normalized = date.value.replace('T', ' ')
         val time = normalized.substringAfter(' ').substringBefore('.')
-        return Line(normalized, time, level, body, text)
+        return Line(normalized, time, level, body, text, process)
     }
 
     /** 日志合并可能重复读取同一行；按完整记录去重，不按消息文字去重。 */
@@ -83,10 +85,15 @@ internal object ModuleLogParser {
         return result
     }
 
+    private val timestampFormat = java.time.format.DateTimeFormatterBuilder()
+        .appendPattern("uuuu-MM-dd HH:mm:ss")
+        .appendFraction(java.time.temporal.ChronoField.NANO_OF_SECOND, 3, 9, true)
+        .toFormatter().withResolverStyle(java.time.format.ResolverStyle.STRICT)
+
     fun epochMillis(line: Line): Long? = runCatching {
         // 无年份的 logcat 只用于近期事件，不据此确认“本次启动已注入”。
         if (line.stamp.length < 23) return null
-        LocalDateTime.parse(line.stamp, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))
+        LocalDateTime.parse(line.stamp, timestampFormat)
             .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
     }.getOrNull()
 }

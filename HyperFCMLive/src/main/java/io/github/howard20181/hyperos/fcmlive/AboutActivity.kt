@@ -17,10 +17,7 @@ import io.github.howard20181.hyperos.fcmlive.theme.ThemeSupport
 import io.github.howard20181.hyperos.fcmlive.ui.AboutActions
 import io.github.howard20181.hyperos.fcmlive.ui.AboutScreen
 import io.github.howard20181.hyperos.fcmlive.ui.UpdateOutcome
-import java.io.BufferedReader
 import java.io.IOException
-import java.io.InputStreamReader
-import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.FileSystems
 import kotlinx.coroutines.CoroutineScope
@@ -41,6 +38,7 @@ import kotlinx.coroutines.launch
  * the runtime palette could not reach.
  */
 class AboutActivity : AppCompatActivity() {
+    private val serviceListener: (io.github.libxposed.service.XposedService?) -> Unit = {}
 
     /** The M3 feedback line. Owned here, drawn by [AboutScreen]'s Scaffold. */
     private val snackbarHostState = SnackbarHostState()
@@ -80,6 +78,7 @@ class AboutActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ThemeSupport.onCreate(this)
+        ModuleServiceConnection.subscribe(this, serviceListener)
         // Keep launcher shortcut icons in sync when the settings page opens.
         ShortcutPublisher.publish(this)
 
@@ -221,14 +220,14 @@ class AboutActivity : AppCompatActivity() {
         }
     }
 
-    private fun currentAllowlist(): Set<String> {
-        val allow = Prefs.readAllowlist(Prefs.remote())
-        return if (allow.isEmpty()) Prefs.readLocalAllowlist(this) else allow
-    }
+    private fun currentAllowlist(): Set<String> =
+        if (Prefs.hasPendingPush(this) || Prefs.remote() == null) Prefs.readLocalAllowlist(this)
+        else Prefs.readAllowlist(Prefs.remote())
+
+    private var documentIoBusy = false
 
     private fun writeAllowlistTo(uri: Uri) {
-        val sorted = currentAllowlist().toMutableList()
-        java.util.Collections.sort(sorted)
+        if (documentIoBusy) return
 
         // ACTION_CREATE_DOCUMENT returns an externally supplied URI. Require a
         // content URI and an explicit write grant before resolving it. This
@@ -249,24 +248,25 @@ class AboutActivity : AppCompatActivity() {
             return
         }
 
-        try {
-            val out: OutputStream = contentResolver.openOutputStream(uri)
-                ?: throw IOException("null stream")
-            out.use { stream ->
-                val sb = StringBuilder()
-                for (pkg in sorted) {
-                    sb.append(pkg).append('\n')
+        documentIoBusy = true
+        uiScope.launch {
+            try {
+                val count = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    val sorted = currentAllowlist().sorted()
+                    contentResolver.openOutputStream(uri)?.use {
+                        it.write(sorted.joinToString("\n", postfix = "\n").toByteArray(StandardCharsets.UTF_8))
+                    } ?: throw IOException("null stream")
+                    sorted.size
                 }
-                stream.write(sb.toString().toByteArray(StandardCharsets.UTF_8))
-                showMessage(getString(R.string.allowlist_export_done, sorted.size))
-            }
-        } catch (t: Throwable) {
-            showMessage(R.string.allowlist_export_failed)
+                showMessage(getString(R.string.allowlist_export_done, count))
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) { showMessage(R.string.allowlist_export_failed) }
+            finally { documentIoBusy = false }
         }
     }
 
     private fun readAllowlistFrom(uri: Uri) {
-        val allow = HashSet<String>()
+        if (documentIoBusy) return
 
         // Same checks as the export side: the provider interprets the path, so
         // it is normalised and the private roots are refused before a stream is
@@ -280,31 +280,22 @@ class AboutActivity : AppCompatActivity() {
             return
         }
 
-        try {
-            val input = contentResolver.openInputStream(uri)
-                ?: throw IOException("null stream")
-            input.use { stream ->
-                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8)).use { reader ->
-                    var line = reader.readLine()
-                    while (line != null) {
-                        val pkg = line.trim()
-                        if (pkg.isNotEmpty() && !pkg.startsWith("#")) {
-                            allow.add(pkg)
-                        }
-                        line = reader.readLine()
-                    }
+        documentIoBusy = true
+        uiScope.launch {
+            try {
+                val allow = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    contentResolver.openInputStream(uri)?.use { AllowlistDocument.read(it) }
+                        ?: throw IOException("null stream")
                 }
-            }
-        } catch (t: Throwable) {
-            showMessage(R.string.allowlist_import_failed)
-            return
+                if (allow.isEmpty()) showMessage(R.string.allowlist_import_empty)
+                else {
+                    Prefs.writeAllowlist(this@AboutActivity, Prefs.remote(), allow)
+                    showMessage(getString(R.string.allowlist_import_done, allow.size))
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) { showMessage(R.string.allowlist_import_failed) }
+            finally { documentIoBusy = false }
         }
-        if (allow.isEmpty()) {
-            showMessage(R.string.allowlist_import_empty)
-            return
-        }
-        Prefs.writeAllowlist(this, Prefs.remote(), allow)
-        showMessage(getString(R.string.allowlist_import_done, allow.size))
     }
 
     /**
@@ -359,6 +350,7 @@ class AboutActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        ModuleServiceConnection.unsubscribe(serviceListener)
         // A message still waiting its turn must not outlive the window it was
         // going to be drawn in.
         uiScope.cancel()

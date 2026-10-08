@@ -32,9 +32,9 @@ object ShortcutPublisher {
                 .setLongLabel(context.getString(R.string.shortcut_settings_long))
                 .setIcon(Icon.createWithResource(context, R.drawable.ic_shortcut_settings))
                 .setIntent(
-                    Intent(Intent.ACTION_VIEW).setClassName(
+                    Intent(MainActivity.ACTION_APP_SETTINGS).setClassName(
                         context.packageName,
-                        "io.github.howard20181.hyperos.fcmlive.AboutActivity"
+                        "io.github.howard20181.hyperos.fcmlive.MainActivity"
                     )
                 )
                 .build()

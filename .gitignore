@@ -1,5 +1,6 @@
 *.iml
 .gradle
+.kotlin/
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -11,6 +12,9 @@
 /build
 /captures
 /outputs
+# 用户提供的设备日志只作本地排查，不进入源码仓库。
+/HyperFCMLive-diagnostics*.txt
+/LSPosed_*.zip
 .externalNativeBuild
 .cxx
 local.properties

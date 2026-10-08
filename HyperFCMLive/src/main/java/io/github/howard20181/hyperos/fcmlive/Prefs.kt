@@ -358,6 +358,21 @@ object Prefs {
     @JvmStatic
     fun remote(): SharedPreferences? = sRemotePrefs
 
+    /** 所有入口共用的待同步补交；只有成功提交的最新值才会清除标记。 */
+    internal fun syncPending(context: Context, remote: SharedPreferences?) {
+        if (remote == null) return
+        if (hasPendingPush(context)) writeAllowlist(context, remote, readLocalAllowlist(context))
+        if (hasPendingStrictPush(context)) writeStrictMode(context, remote, readLocalStrictMode(context))
+        if (hasPendingWechatDozeKeepoutPush(context)) writeWechatDozeKeepout(context, remote, readLocalWechatDozeKeepout(context))
+        if (hasPendingWifiWeakSignalSwitchRelaxedPush(context)) writeWifiWeakSignalSwitchRelaxed(context, remote, readLocalWifiWeakSignalSwitchRelaxed(context))
+        if (hasPendingWifiWeakSignalFloorPush(context)) writeWifiWeakSignalFloor(context, remote, readLocalWifiWeakSignalFloor(context))
+        if (hasPendingSleepKeepalivePush(context)) writeSleepKeepalive(context, remote, readLocalSleepKeepalive(context))
+        if (hasPendingSleepKeepaliveDataPush(context)) writeSleepKeepaliveData(context, remote, readLocalSleepKeepaliveData(context))
+        if (hasPendingWakeStoppedPackagesPush(context)) writeWakeStoppedPackages(context, remote, readLocalWakeStoppedPackages(context))
+        if (hasPendingWakeAutostartRelaxedPush(context)) writeWakeAutostartRelaxed(context, remote, readLocalWakeAutostartRelaxed(context))
+        if (hasPendingWakeWriteAutostartPush(context)) writeWakeWriteAutostart(context, remote, readLocalWakeWriteAutostart(context))
+    }
+
     /** Package names the user allows FCM to wake / auto-launch. */
     @JvmStatic
     fun readAllowlist(remotePrefs: SharedPreferences?): MutableSet<String> {
@@ -439,22 +454,7 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         enabled: Boolean
     ) {
-        val app = appContext(context)
-        localPrefs(app).edit().putBoolean(KEY_SLEEP_KEEPALIVE, enabled).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit().putBoolean(KEY_SLEEP_KEEPALIVE_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit().putBoolean(KEY_SLEEP_KEEPALIVE_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putBoolean(KEY_SLEEP_KEEPALIVE, enabled).commit()
-            } catch (t: Throwable) {
-                localPrefs(app).edit().putBoolean(KEY_SLEEP_KEEPALIVE_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_SLEEP_KEEPALIVE, KEY_SLEEP_KEEPALIVE_PENDING_PUSH, enabled)
     }
 
     /** Sleep-keepalive data sub-switch value as the UI last left it. */
@@ -482,23 +482,7 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         enabled: Boolean
     ) {
-        val app = appContext(context)
-        localPrefs(app).edit().putBoolean(KEY_SLEEP_KEEPALIVE_DATA, enabled).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit().putBoolean(KEY_SLEEP_KEEPALIVE_DATA_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit().putBoolean(KEY_SLEEP_KEEPALIVE_DATA_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putBoolean(KEY_SLEEP_KEEPALIVE_DATA, enabled).commit()
-            } catch (t: Throwable) {
-                localPrefs(app).edit()
-                    .putBoolean(KEY_SLEEP_KEEPALIVE_DATA_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_SLEEP_KEEPALIVE_DATA, KEY_SLEEP_KEEPALIVE_DATA_PENDING_PUSH, enabled)
     }
 
     /** WeChat-doze-keepout value as the UI last left it; the mirror is what the experiment screen shows. */
@@ -526,22 +510,7 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         enabled: Boolean
     ) {
-        val app = appContext(context)
-        localPrefs(app).edit().putBoolean(KEY_WECHAT_DOZE_KEEPOUT, enabled).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit().putBoolean(KEY_WECHAT_DOZE_KEEPOUT_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit().putBoolean(KEY_WECHAT_DOZE_KEEPOUT_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putBoolean(KEY_WECHAT_DOZE_KEEPOUT, enabled).commit()
-            } catch (t: Throwable) {
-                localPrefs(app).edit().putBoolean(KEY_WECHAT_DOZE_KEEPOUT_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_WECHAT_DOZE_KEEPOUT, KEY_WECHAT_DOZE_KEEPOUT_PENDING_PUSH, enabled)
     }
 
     /** Relaxed WiFi weak-signal switch value as the UI last left it. */
@@ -570,26 +539,7 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         enabled: Boolean
     ) {
-        val app = appContext(context)
-        localPrefs(app).edit().putBoolean(KEY_WIFI_WEAK_SIGNAL_SWITCH_RELAXED, enabled).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit()
-                .putBoolean(KEY_WIFI_WEAK_SIGNAL_SWITCH_RELAXED_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit()
-            .putBoolean(KEY_WIFI_WEAK_SIGNAL_SWITCH_RELAXED_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit()
-                    .putBoolean(KEY_WIFI_WEAK_SIGNAL_SWITCH_RELAXED, enabled).commit()
-            } catch (t: Throwable) {
-                localPrefs(app).edit()
-                    .putBoolean(KEY_WIFI_WEAK_SIGNAL_SWITCH_RELAXED_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_WIFI_WEAK_SIGNAL_SWITCH_RELAXED, KEY_WIFI_WEAK_SIGNAL_SWITCH_RELAXED_PENDING_PUSH, enabled)
     }
 
     /** True when [value] is one of the offered floors. */
@@ -640,25 +590,7 @@ object Prefs {
         floor: Int
     ) {
         val value = sanitizeWeakSignalFloor(floor)
-        val app = appContext(context)
-        localPrefs(app).edit().putInt(KEY_WIFI_WEAK_SIGNAL_FLOOR, value).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit()
-                .putBoolean(KEY_WIFI_WEAK_SIGNAL_FLOOR_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit()
-            .putBoolean(KEY_WIFI_WEAK_SIGNAL_FLOOR_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putInt(KEY_WIFI_WEAK_SIGNAL_FLOOR, value).commit()
-            } catch (t: Throwable) {
-                localPrefs(app).edit()
-                    .putBoolean(KEY_WIFI_WEAK_SIGNAL_FLOOR_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_WIFI_WEAK_SIGNAL_FLOOR, KEY_WIFI_WEAK_SIGNAL_FLOOR_PENDING_PUSH, value)
     }
 
     /** Wake master-switch value as the UI last left it; the mirror is what the experiment screen shows. */
@@ -686,25 +618,7 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         enabled: Boolean
     ) {
-        val app = appContext(context)
-        localPrefs(app).edit().putBoolean(KEY_WAKE_STOPPED_PACKAGES, enabled).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit()
-                .putBoolean(KEY_WAKE_STOPPED_PACKAGES_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit()
-            .putBoolean(KEY_WAKE_STOPPED_PACKAGES_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putBoolean(KEY_WAKE_STOPPED_PACKAGES, enabled).commit()
-            } catch (t: Throwable) {
-                localPrefs(app).edit()
-                    .putBoolean(KEY_WAKE_STOPPED_PACKAGES_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_WAKE_STOPPED_PACKAGES, KEY_WAKE_STOPPED_PACKAGES_PENDING_PUSH, enabled)
     }
 
     /** Autostart-relaxed master switch value as the UI last left it. */
@@ -732,25 +646,7 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         enabled: Boolean
     ) {
-        val app = appContext(context)
-        localPrefs(app).edit().putBoolean(KEY_WAKE_AUTOSTART_RELAXED, enabled).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit()
-                .putBoolean(KEY_WAKE_AUTOSTART_RELAXED_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit()
-            .putBoolean(KEY_WAKE_AUTOSTART_RELAXED_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putBoolean(KEY_WAKE_AUTOSTART_RELAXED, enabled).commit()
-            } catch (t: Throwable) {
-                localPrefs(app).edit()
-                    .putBoolean(KEY_WAKE_AUTOSTART_RELAXED_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_WAKE_AUTOSTART_RELAXED, KEY_WAKE_AUTOSTART_RELAXED_PENDING_PUSH, enabled)
     }
 
     /** Autostart-write sub-switch value as the UI last left it. */
@@ -778,32 +674,13 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         enabled: Boolean
     ) {
-        val app = appContext(context)
-        localPrefs(app).edit().putBoolean(KEY_WAKE_WRITE_AUTOSTART, enabled).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit()
-                .putBoolean(KEY_WAKE_WRITE_AUTOSTART_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit()
-            .putBoolean(KEY_WAKE_WRITE_AUTOSTART_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putBoolean(KEY_WAKE_WRITE_AUTOSTART, enabled).commit()
-            } catch (t: Throwable) {
-                localPrefs(app).edit()
-                    .putBoolean(KEY_WAKE_WRITE_AUTOSTART_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
+        writeConfig(context, remotePrefs, KEY_WAKE_WRITE_AUTOSTART, KEY_WAKE_WRITE_AUTOSTART_PENDING_PUSH, enabled) {
             // Turning the pair on is the one moment the user is looking at this
             // row, so the write is applied to the whole allowlist now rather
             // than whenever each app happens to receive its next push. Sent only
             // when enabling: turning it off deliberately leaves what was already
             // written alone, and the module never learns the previous values.
-            if (enabled) {
-                broadcastApplyAutostart(app)
-            }
+            if (enabled) broadcastApplyAutostart(appContext(context))
         }
     }
 
@@ -823,24 +700,7 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         enabled: Boolean
     ) {
-        val app = appContext(context)
-        localPrefs(app).edit().putBoolean(KEY_STRICT_MODE, enabled).apply()
-        if (remotePrefs == null) {
-            localPrefs(app).edit().putBoolean(KEY_STRICT_PENDING_PUSH, true).apply()
-            broadcastAllowlistChanged(app)
-            return
-        }
-        localPrefs(app).edit().putBoolean(KEY_STRICT_PENDING_PUSH, false).apply()
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putBoolean(KEY_STRICT_MODE, enabled).commit()
-            } catch (t: Throwable) {
-                // As with the allowlist: a failed write must not pass for a live
-                // change, so the next bind pushes the mirror up again.
-                localPrefs(app).edit().putBoolean(KEY_STRICT_PENDING_PUSH, true).apply()
-            }
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_STRICT_MODE, KEY_STRICT_PENDING_PUSH, enabled)
     }
 
     private fun localPrefs(context: Context): SharedPreferences {
@@ -881,26 +741,7 @@ object Prefs {
         remotePrefs: SharedPreferences?,
         allowlist: Set<String>
     ) {
-        val copy = HashSet(allowlist)
-        val app = appContext(context)
-        writeLocalAllowlist(app, copy)
-        if (remotePrefs == null) {
-            markPendingPush(app)
-            broadcastAllowlistChanged(app)
-            return
-        }
-        clearPendingPush(app)
-        WRITER.execute {
-            try {
-                remotePrefs.edit().putStringSet(KEY_ALLOWLIST, copy).commit()
-            } catch (t: Throwable) {
-                // A failed write must not pass for a live change: keep the flag so
-                // the next bind pushes the mirror up again.
-                markPendingPush(app)
-            }
-            // Announced after the write, so a reader of the prefs sees this value.
-            broadcastAllowlistChanged(app)
-        }
+        writeConfig(context, remotePrefs, KEY_ALLOWLIST, KEY_PENDING_PUSH, allowlist)
     }
 
     /**
@@ -913,13 +754,30 @@ object Prefs {
      * [GROUP_CONFIG] wholesale, so this also carries a strict-mode change
      * (see [writeStrictMode]) — which is why the two share one action.
      */
+    private val CONFIG_WRITER by lazy { ConfigWriteQueue(WRITER) }
+
+    private fun writeConfig(context: Context, remote: SharedPreferences?, key: String,
+        pendingKey: String, value: Any, onCommitted: () -> Unit = {}) {
+        val app = appContext(context)
+        CONFIG_WRITER.write(localPrefs(app), remote, key, pendingKey, value) {
+            broadcastAllowlistChanged(app)
+            onCommitted()
+        }
+    }
+
+    private fun sendConfigBroadcast(context: Context, action: String) {
+        // 接收端按系统附带的 UID 验证，缺失身份不再放行。
+        val options = android.app.BroadcastOptions.makeBasic().setShareIdentityEnabled(true)
+        context.sendBroadcast(Intent(action).setPackage("android"), null, options.toBundle())
+    }
+
     @JvmStatic
     fun broadcastAllowlistChanged(context: Context) {
         val app = appContext(context)
-        app.sendBroadcast(Intent(ACTION_ALLOWLIST_CHANGED))
+        sendConfigBroadcast(app, ACTION_ALLOWLIST_CHANGED)
         val handler = Handler(Looper.getMainLooper())
-        handler.postDelayed({ app.sendBroadcast(Intent(ACTION_ALLOWLIST_CHANGED)) }, 400L)
-        handler.postDelayed({ app.sendBroadcast(Intent(ACTION_ALLOWLIST_CHANGED)) }, 1500L)
+        handler.postDelayed({ sendConfigBroadcast(app, ACTION_ALLOWLIST_CHANGED) }, 400L)
+        handler.postDelayed({ sendConfigBroadcast(app, ACTION_ALLOWLIST_CHANGED) }, 1500L)
     }
 
     /**
@@ -933,6 +791,6 @@ object Prefs {
      */
     @JvmStatic
     fun broadcastApplyAutostart(context: Context) {
-        appContext(context).sendBroadcast(Intent(ACTION_APPLY_AUTOSTART))
+        sendConfigBroadcast(appContext(context), ACTION_APPLY_AUTOSTART)
     }
 }

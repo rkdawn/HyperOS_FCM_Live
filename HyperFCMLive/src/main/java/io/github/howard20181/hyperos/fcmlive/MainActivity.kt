@@ -34,7 +34,6 @@ import io.github.howard20181.hyperos.fcmlive.ui.MainScreen
 import io.github.howard20181.hyperos.fcmlive.ui.MainTopBarState
 import io.github.howard20181.hyperos.fcmlive.ui.OverflowState
 import io.github.libxposed.service.XposedService
-import io.github.libxposed.service.XposedServiceHelper
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
@@ -543,7 +542,17 @@ class MainActivity : AppCompatActivity() {
             ThemeSupport.reapplyWindow(this)
             appliedPalette = palette
         }
-        // 返回设置页仅重应用主题，不新增扫描；其余加载触发保留作者原有逻辑。
+        // 只同步设置页导入/修改的本地配置，不重新扫描应用或触发刷新动画。
+        val latest = Prefs.readLocalAllowlist(this)
+        val latestStrict = Prefs.readLocalStrictMode(this)
+        if (latest != allowlist || latestStrict != strictMode) {
+            allowlist = latest
+            strictMode = latestStrict
+            allApps.forEach { it.checked = allowlist.contains(it.packageName) }
+            sortApps()
+            filterApps(currentQuery)
+            pushUiState()
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -619,6 +628,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        ModuleServiceConnection.unsubscribe(serviceListener)
         cancelEmptyListMessage()
         uiScope.cancel()
         pendingFilter?.let {
@@ -653,6 +663,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun exitSearch() {
+        pendingFilter?.let(uiHandler::removeCallbacks)
+        pendingFilter = null
         searching = false
         updateBackCallback()
         // Leaving search disposes the field, which drops focus and lowers the
@@ -688,9 +700,7 @@ class MainActivity : AppCompatActivity() {
         // The gesture is known from here on: stop advertising it.
         multiSelectKnown = true
         if (searching) {
-            searching = false
-            currentQuery = ""
-            filterApps("")
+            exitSearch()
         }
         multiSelectMode = true
         updateBackCallback()
@@ -875,8 +885,15 @@ class MainActivity : AppCompatActivity() {
 
     /** 菜单与桌面快捷方式统一进入诊断页，GMS 官方诊断仍保留在页内。 */
     private fun handleShortcutIntent(intent: Intent?) {
-        if (intent?.action == ACTION_FCM_DIAGNOSTICS) {
-            openFcmDiagnostics()
+        when (intent?.action) {
+            ACTION_FCM_DIAGNOSTICS -> {
+                intent.action = null
+                openFcmDiagnostics()
+            }
+            ACTION_APP_SETTINGS -> {
+                intent.action = null
+                startActivity(Intent(this, AboutActivity::class.java))
+            }
         }
     }
 
@@ -908,29 +925,16 @@ class MainActivity : AppCompatActivity() {
         return (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
     }
 
-    private fun initXposedService() {
-        try {
-            XposedServiceHelper.registerListener(object : XposedServiceHelper.OnServiceListener {
-                override fun onServiceBind(service: XposedService) {
-                    xposedService = service
-                    runOnUiThreadSafe {
-                        // Publish for other screens (About import/export).
-                        Prefs.setRemote(remotePrefs())
-                        // Remote prefs are the source of truth once bound.
-                        reloadAllowlist()
-                        loadApps()
-                    }
-                }
-
-                override fun onServiceDied(service: XposedService) {
-                    if (xposedService === service) {
-                        xposedService = null
-                        Prefs.setRemote(null)
-                    }
-                }
-            })
-        } catch (ignored: Throwable) {
+    private val serviceListener: (XposedService?) -> Unit = { service ->
+        xposedService = service
+        if (service != null) runOnUiThreadSafe {
+            reloadAllowlist()
+            loadApps()
         }
+    }
+
+    private fun initXposedService() {
+        ModuleServiceConnection.subscribe(this, serviceListener)
     }
 
     private fun remotePrefs(): SharedPreferences? {
@@ -944,94 +948,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun reloadAllowlist() {
         val prefs = remotePrefs() ?: return
-        // Same repair as the allowlist below, for the strict-mode flag: a toggle
-        // made before the service bound lives only in the mirror, and adopting
-        // the older remote value here would silently revert it.
-        if (Prefs.hasPendingStrictPush(this)) {
-            Prefs.writeStrictMode(this, prefs, strictMode)
-        }
-        if (Prefs.hasPendingWechatDozeKeepoutPush(this)) {
-            // And for the WeChat keepout switch: a flip made before the
-            // service bound lives only in the local mirror.
-            Prefs.writeWechatDozeKeepout(
-                this, prefs, Prefs.readLocalWechatDozeKeepout(this)
-            )
-        }
-        if (Prefs.hasPendingWifiWeakSignalSwitchRelaxedPush(this)) {
-            // And for the relaxed WiFi weak-signal switch, which the experiment
-            // screen owns: a flip made before the service bound lives only in
-            // the local mirror.
-            Prefs.writeWifiWeakSignalSwitchRelaxed(
-                this, prefs, Prefs.readLocalWifiWeakSignalSwitchRelaxed(this)
-            )
-        }
-        if (Prefs.hasPendingWifiWeakSignalFloorPush(this)) {
-            // Same repair for that switch's floor. Without it a choice made
-            // before the service bound would stay local forever, and the hook
-            // would go on using the default — silently wider or narrower than
-            // what the screen says it is using.
-            Prefs.writeWifiWeakSignalFloor(
-                this, prefs, Prefs.readLocalWifiWeakSignalFloor(this)
-            )
-        }
-        if (Prefs.hasPendingSleepKeepalivePush(this)) {
-            // Same repair for the sleep-keepalive switch, which the experiment
-            // screen owns; without this a flip made before the service bound
-            // would be reverted here rather than pushed up.
-            Prefs.writeSleepKeepalive(this, prefs, Prefs.readLocalSleepKeepalive(this))
-        }
-        if (Prefs.hasPendingSleepKeepaliveDataPush(this)) {
-            // And for its mobile-data sub-switch.
-            Prefs.writeSleepKeepaliveData(
-                this, prefs, Prefs.readLocalSleepKeepaliveData(this)
-            )
-        }
-        if (Prefs.hasPendingWakeStoppedPackagesPush(this)) {
-            // Same repair for the wake switch, which the experiment screen
-            // owns; without this a flip made before the service bound would be
-            // reverted here rather than pushed up.
-            Prefs.writeWakeStoppedPackages(
-                this, prefs, Prefs.readLocalWakeStoppedPackages(this)
-            )
-        }
-        if (Prefs.hasPendingWakeAutostartRelaxedPush(this)) {
-            // And for the second wake pair's master switch, which the experiment
-            // screen owns; same repair, same reason.
-            Prefs.writeWakeAutostartRelaxed(
-                this, prefs, Prefs.readLocalWakeAutostartRelaxed(this)
-            )
-        }
-        if (Prefs.hasPendingWakeWriteAutostartPush(this)) {
-            // And for its autostart-write sub-switch.
-            Prefs.writeWakeWriteAutostart(
-                this, prefs, Prefs.readLocalWakeWriteAutostart(this)
-            )
-        }
+        // 待提交值以本地为准；成功提交后才采纳远端，空名单也是有效选择。
         if (Prefs.hasPendingPush(this)) {
-            // A check made before the service bound is newer than the remote set:
-            // push it up (the write broadcasts, so system_server re-reads too)
-            // instead of adopting the stale value, which used to silently revert
-            // the user's selection.
-            Prefs.writeAllowlist(this, prefs, allowlist)
+            allowlist = Prefs.readLocalAllowlist(this)
         } else {
-            var next = Prefs.readAllowlist(prefs)
-            // Remote is authoritative, but an empty remote with a populated local
-            // mirror means the allowlist was imported before the service bound
-            // (About screen): push the mirror up instead of wiping it.
-            if (next.isEmpty()) {
-                val local = Prefs.readLocalAllowlist(this)
-                if (local.isNotEmpty()) {
-                    Prefs.writeAllowlist(this, prefs, local)
-                    next = local
-                }
-            } else {
-                Prefs.writeLocalAllowlist(this, next)
-            }
-            allowlist = next
-            // This runs on every app open, so it also repairs a system_server copy
-            // that missed its broadcast (e.g. one sent during early boot).
-            Prefs.broadcastAllowlistChanged(this)
+            allowlist = Prefs.readAllowlist(prefs)
+            Prefs.writeLocalAllowlist(this, allowlist)
         }
+        strictMode = Prefs.readLocalStrictMode(this)
+        if (!Prefs.hasPendingPush(this)) Prefs.broadcastAllowlistChanged(this)
         for (app in allApps) {
             app.checked = allowlist.contains(app.packageName)
         }
@@ -1192,6 +1117,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAG_UI = "HyperFCMLive"
 
         /** Launcher shortcut: open GMS FCM diagnostics. */
+        const val ACTION_APP_SETTINGS = "io.github.howard20181.hyperos.fcmlive.APP_SETTINGS"
         const val ACTION_FCM_DIAGNOSTICS = "io.github.howard20181.hyperos.fcmlive.FCM_DIAGNOSTICS"
         /** MIUI 13 / HyperOS runtime gate on top of QUERY_ALL_PACKAGES. */
         private const val GET_INSTALLED_APPS_PERMISSION =

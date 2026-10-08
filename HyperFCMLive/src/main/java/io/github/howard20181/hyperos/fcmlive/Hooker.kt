@@ -638,13 +638,35 @@ class Hooker : XposedModule() {
             },
         )
 
+    @Volatile private var retired = false
+    private val workerLock = Any()
+    private val registeredAllowlistReceiver = java.util.concurrent.atomic.AtomicReference<Pair<Context, BroadcastReceiver>?>(null)
+    private val registrationWorkerStarted = AtomicBoolean(false)
+    @Volatile private var registrationThread: Thread? = null
+    @Volatile private var wifiRetryThread: Thread? = null
+
+    private fun retireOwnedResources() {
+        val handlers = synchronized(workerLock) {
+            retired = true
+            listOfNotNull(allowlistHandler, probeHandler)
+        }
+        registrationThread?.interrupt()
+        wifiRetryThread?.interrupt()
+        // 系统 IPC 必须在模块锁外执行，避免与 AMS 广播锁反向获取。
+        registeredAllowlistReceiver.getAndSet(null)?.let { registered ->
+            runCatching { registered.first.unregisterReceiver(registered.second) }
+        }
+        allowlistReceiverRegistered = false
+        for (handler in handlers) {
+            handler.removeCallbacksAndMessages(null)
+            handler.looper.quitSafely()
+        }
+    }
+
     override fun onHotReloading(param: XposedModuleInterface.HotReloadingParam): Boolean {
-        // Hot reload is fully supported on LSPosed API 102: onHotReloaded unhooks every
-        // stale handle and re-runs the whole install sequence, so nothing is left behind
-        // that would need a reboot. Do not reintroduce any "reboot required" wording —
-        // HELP.md / README state no reboot is needed and this method proves it.
         log(Log.INFO, TAG, "Hot reload requested — re-installing hooks without reboot")
         param.setSavedInstanceState(this.param)
+        retireOwnedResources()
         return true
     }
 
@@ -1646,7 +1668,7 @@ class Hooker : XposedModule() {
                         // us whether the nudge broke a connection that was still alive.
                         probeGmsTraffic("before sleep-exit nudge")
                         Thread { recoverGmsConnection(context) }.start()
-                        probeBackgroundHandler().postDelayed(
+                        probeBackgroundHandler()?.postDelayed(
                             { probeGmsTraffic("after sleep-exit nudge") },
                             GMS_TRAFFIC_NUDGE_RESAMPLE_MS
                         )
@@ -1832,11 +1854,13 @@ class Hooker : XposedModule() {
             )
         }, "fcmlive-wifi-scorer")
         waiter.isDaemon = true
-        waiter.start()
+        wifiRetryThread = waiter
+        if (!retired) waiter.start()
     }
 
     /** Installs the scorer hook if the class can be reached this time. */
     private fun tryHookWifiScorer(classLoader: ClassLoader): Boolean {
+        if (retired) return true
         if (wifiScorerResolved.get()) {
             return true
         }
@@ -3413,6 +3437,7 @@ class Hooker : XposedModule() {
 
 
     private fun loadAllowlistFromRemotePrefs() {
+        if (retired) return
         try {
             val prefs = getRemotePreferences(Prefs.GROUP_CONFIG)
             val set = prefs.getStringSet(Prefs.KEY_ALLOWLIST, emptySet())
@@ -3476,41 +3501,28 @@ class Hooker : XposedModule() {
     @Volatile
     private var allowlistHandler: Handler? = null
 
-    private fun allowlistBackgroundHandler(): Handler {
-        val handler = allowlistHandler
-        if (handler != null) {
-            return handler
-        }
-        synchronized(this) {
-            if (allowlistHandler == null) {
-                val thread = HandlerThread("fcmlive-allowlist")
-                thread.start()
-                allowlistHandler = Handler(thread.looper)
-            }
-            return allowlistHandler!!
+    private fun allowlistBackgroundHandler(): Handler? = synchronized(workerLock) {
+        if (retired) return null
+        allowlistHandler ?: HandlerThread("fcmlive-allowlist").let { thread ->
+            thread.start()
+            Handler(thread.looper).also { allowlistHandler = it }
         }
     }
 
     private fun requestAllowlistReload() {
+        if (retired || !allowlistReloadQueued.compareAndSet(false, true)) return
         val sinceLastRead = SystemClock.uptimeMillis() - sAllowlistReadMs
-        if (sinceLastRead >= ALLOWLIST_RELOAD_MIN_MS) {
-            allowlistBackgroundHandler().post { loadAllowlistFromRemotePrefs() }
-            return
-        }
-        if (!allowlistReloadQueued.compareAndSet(false, true)) {
-            return
-        }
-        allowlistBackgroundHandler().postDelayed({
+        val queued = allowlistBackgroundHandler()?.postDelayed({
             allowlistReloadQueued.set(false)
             loadAllowlistFromRemotePrefs()
-        }, ALLOWLIST_RELOAD_MIN_MS - sinceLastRead)
+        }, (ALLOWLIST_RELOAD_MIN_MS - sinceLastRead).coerceAtLeast(0L)) == true
+        if (!queued) allowlistReloadQueued.set(false)
     }
 
     private fun installAllowlistReceiverAsync() {
-        if (allowlistReceiverRegistered) {
-            return
-        }
+        if (retired || allowlistReceiverRegistered || !registrationWorkerStarted.compareAndSet(false, true)) return
         val t = Thread({
+            try {
             // Early boot is why this loop exists, so an early failure is the
             // expected case, not the reportable one: at uptime ~13s
             // `ContextImpl.registerReceiverInternal` still holds a null
@@ -3522,6 +3534,7 @@ class Hooker : XposedModule() {
             // heals itself 3s later, and would then let the once-per-boot guard
             // swallow a genuine failure on the lazy path.
             for (attempt in 0 until ALLOWLIST_REGISTER_MAX_ATTEMPTS) {
+                if (retired) return@Thread
                 val lastAttempt = attempt == ALLOWLIST_REGISTER_MAX_ATTEMPTS - 1
                 if (registerAllowlistReceiver(reportFailure = lastAttempt)) {
                     return@Thread
@@ -3539,13 +3552,18 @@ class Hooker : XposedModule() {
                 Log.WARN, TAG, "Allowlist receiver not installed during boot;" +
                     " falling back to lazy registration"
             )
+            } finally {
+                registrationWorkerStarted.set(false)
+            }
         }, "fcmlive-allowlist-register")
         t.isDaemon = true
-        t.start()
+        registrationThread = t
+        if (!retired) t.start()
     }
 
     private fun getFcmAllowlist(): Set<String> {
-        registerAllowlistReceiver()
+        // 广播热路径可能持有 AMS 锁：这里只排队，不能同步注册接收器。
+        if (!allowlistReceiverRegistered && !retired) installAllowlistReceiverAsync()
         if (!allowlistReceiverRegistered &&
             SystemClock.uptimeMillis() - sAllowlistFreshMs >= ALLOWLIST_STALE_MS
         ) {
@@ -3607,6 +3625,7 @@ class Hooker : XposedModule() {
      *   a genuine failure could use it.
      */
     private fun registerAllowlistReceiver(reportFailure: Boolean = true): Boolean {
+        if (retired) return false
         if (allowlistReceiverRegistered) {
             return true
         }
@@ -3617,6 +3636,7 @@ class Hooker : XposedModule() {
             val sys = getSystemContext() ?: return false
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
+                    if (retired) return
                     // This receiver *has* to be RECEIVER_EXPORTED: it lives on
                     // the system_server context and the only legitimate sender —
                     // the settings app — is a different uid, so a non-exported
@@ -3640,14 +3660,19 @@ class Hooker : XposedModule() {
                     }
                     when (intent.action) {
                         Prefs.ACTION_ALLOWLIST_CHANGED -> requestAllowlistReload()
-                        Prefs.ACTION_APPLY_AUTOSTART -> applyAutostartToAllowlist()
+                        Prefs.ACTION_APPLY_AUTOSTART -> applyAutostartToAllowlist(fromUid / 100000)
                     }
                 }
             }
             val filter = IntentFilter(Prefs.ACTION_ALLOWLIST_CHANGED)
             filter.addAction(Prefs.ACTION_APPLY_AUTOSTART)
-            val handler = allowlistBackgroundHandler()
+            val handler = allowlistBackgroundHandler() ?: return false
             sys.registerReceiver(receiver, filter, null, handler, Context.RECEIVER_EXPORTED)
+            registeredAllowlistReceiver.set(Pair.create(sys, receiver))
+            if (retired) {
+                registeredAllowlistReceiver.getAndSet(null)?.let { runCatching { it.first.unregisterReceiver(it.second) } }
+                return false
+            }
             allowlistReceiverRegistered = true
             log(Log.INFO, TAG, "Allowlist receiver installed")
             return true
@@ -3666,35 +3691,12 @@ class Hooker : XposedModule() {
         }
     }
 
-    /**
-     * Whether a delivery was positively sent by somebody other than this module's
-     * own app.
-     *
-     * Registration cannot express this: a required broadcast permission would have
-     * to be granted to the settings app, and a permission that is ever missing
-     * would take the whole allowlist path down silently — a worse failure than the
-     * one it guards against. So the identity the system already stamps on every
-     * delivery is read back instead ([BroadcastReceiver.getSentFromPackage] /
-     * [BroadcastReceiver.getSentFromUid], API 34+, and minSdk is 35).
-     *
-     * Fail-open by construction: only a sender that is *positively* identified as
-     * different is rejected. Anything unstamped (null package and INVALID_UID) is
-     * processed exactly as it was before this check existed, so it can never
-     * narrow the legitimate path — the worst case is that it filters nothing.
-     */
+    /** 按系统提供的 UID 核验；发送端显式共享身份，未提供身份时拒绝处理。 */
     private fun allowlistSenderIsForeign(fromPackage: String?, fromUid: Int): Boolean {
-        if (fromPackage != null) {
-            return fromPackage != Prefs.MODULE_PKG
-        }
-        if (fromUid == Process.INVALID_UID) {
-            return false
-        }
-        // Unknown package but a known uid: system / root / shell are the only
-        // uids besides the module's own that legitimately drive this (adb
-        // `am broadcast` debugging).
-        return fromUid != Process.SYSTEM_UID &&
-            fromUid != Process.ROOT_UID &&
-            fromUid != Process.SHELL_UID
+        val moduleUid = runCatching {
+            getSystemContext()?.packageManager?.getApplicationInfo(Prefs.MODULE_PKG, 0)?.uid
+        }.getOrNull()
+        return !ModuleGuards.authorizedSender(fromUid, moduleUid)
     }
 
     @Volatile
@@ -3868,6 +3870,8 @@ class Hooker : XposedModule() {
             )
             return
         }
+        // 已匹配的 AMS 签名最后一项为目标 userId；负值不猜测为主用户。
+        val finalUserArgIndex = broadcastMethod.parameterTypes.lastIndex
         val finalGetRecordMethod = getRecordMethod
         val finalIntentArgIndex = intentArgIndex
         hookE(broadcastMethod).intercept { chain: XposedInterface.Chain ->
@@ -3993,7 +3997,17 @@ class Hooker : XposedModule() {
                         isWakeWriteAutostartEnabled() &&
                         wakeExplicitlyAllows(autostartPackage)
                     ) {
-                        maybeWriteAutostart(autostartPackage)
+                        val targetUser = chain.getArg(finalUserArgIndex) as? Int
+                        if (targetUser != null && ModuleGuards.validUser(targetUser)) {
+                            // 原 AMS 尚未执行：先按未清除的 Binder 身份验证跨用户权限。
+                            val senderUid = Binder.getCallingUid()
+                            val crossUserAllowed = getSystemContext()?.checkPermission(
+                                "android.permission.INTERACT_ACROSS_USERS_FULL", Binder.getCallingPid(), senderUid
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (ModuleGuards.mayWriteUser(targetUser, senderUid, crossUserAllowed)) {
+                                maybeWriteAutostart(autostartPackage, targetUser)
+                            }
+                        }
                     }
                 } catch (t: Throwable) {
                     log(Log.ERROR, TAG, "Wake autostart write hook failed", t)
@@ -4107,9 +4121,9 @@ class Hooker : XposedModule() {
      * package already at `MODE_ALLOWED` (and every package inside its throttle
      * window) prints nothing at all.
      */
-    private fun maybeWriteAutostart(packageName: String) {
-        if (writeAutostartIfNeeded(packageName, throttle = true) == AUTOSTART_WRITTEN) {
-            log(Log.INFO, TAG, "wake: set the autostart op (10008) of $packageName to allowed")
+    private fun maybeWriteAutostart(packageName: String, userId: Int) {
+        if (writeAutostartIfNeeded(packageName, userId, throttle = true) == AUTOSTART_WRITTEN) {
+            log(Log.INFO, TAG, "wake: set the autostart op (10008) of $packageName user=$userId to allowed")
         }
     }
 
@@ -4136,7 +4150,8 @@ class Hooker : XposedModule() {
      * over a list the user can see, and per-package lines would print all of it
      * on every tap.
      */
-    private fun applyAutostartToAllowlist() {
+    private fun applyAutostartToAllowlist(userId: Int) {
+        if (retired || !ModuleGuards.validUser(userId)) return
         if (!isWakeWriteAutostartEnabled()) {
             return
         }
@@ -4156,7 +4171,7 @@ class Hooker : XposedModule() {
             // throttle = false: this is a user action, so it writes even inside
             // the lazy path's window. An already-allowed package is still only
             // a read, so re-tapping the switch costs no settings writes.
-            when (writeAutostartIfNeeded(pkg, throttle = false)) {
+            when (writeAutostartIfNeeded(pkg, userId, throttle = false)) {
                 AUTOSTART_WRITTEN -> written++
                 AUTOSTART_FAILED -> failed++
                 else -> already++
@@ -4209,7 +4224,9 @@ class Hooker : XposedModule() {
      * logged here with the exception — a failure has to name its package to be
      * useful, and it is never the common case.
      */
-    private fun writeAutostartIfNeeded(packageName: String, throttle: Boolean): Int {
+    private fun writeAutostartIfNeeded(packageName: String, userId: Int, throttle: Boolean): Int {
+        if (retired || !ModuleGuards.validUser(userId)) return AUTOSTART_FAILED
+        val key = ModuleGuards.autostartKey(packageName, userId)
         val setMode = APP_OPS_SET_MODE
         val checkOpNoThrow = APP_OPS_CHECK_OP_NO_THROW
         if (setMode == null || checkOpNoThrow == null) {
@@ -4217,12 +4234,12 @@ class Hooker : XposedModule() {
         }
         if (throttle) {
             val now = SystemClock.elapsedRealtime()
-            val last = wakeAutostartLastMs.putIfAbsent(packageName, now)
+            val last = wakeAutostartLastMs.putIfAbsent(key, now)
             if (last != null) {
                 if (now - last < WAKE_AUTOSTART_COOLDOWN_MS) {
                     return AUTOSTART_ALREADY
                 }
-                wakeAutostartLastMs[packageName] = now
+                wakeAutostartLastMs[key] = now
             }
         }
         val context = getSystemContext() ?: return AUTOSTART_FAILED
@@ -4230,7 +4247,10 @@ class Hooker : XposedModule() {
         try {
             val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager
                 ?: return AUTOSTART_FAILED
-            val uid = context.packageManager.getApplicationInfo(packageName, 0).uid
+            val pm = context.packageManager
+            val uidMethod = pm.javaClass.getMethod("getPackageUidAsUser", String::class.java, Int::class.javaPrimitiveType)
+            val uid = getInvoker(uidMethod).invoke(pm, packageName, userId) as Int
+            if (uid / 100000 != userId) return AUTOSTART_FAILED
             val current =
                 getInvoker(checkOpNoThrow).invoke(appOps, MIUIOP_AUTO_START, uid, packageName)
             if (current == AppOpsManager.MODE_ALLOWED) {
@@ -4401,6 +4421,7 @@ class Hooker : XposedModule() {
      *     measured hit rate of zero for GMS on this ROM.
      */
     private fun startGmsTrafficProbe() {
+        if (retired) return
         // Claim the latest chain generation before scheduling: on every hot
         // reload hookPackage re-runs and a fresh module classloader brings a
         // fresh companion, so a plain field cannot be seen by chains scheduled
@@ -4415,12 +4436,12 @@ class Hooker : XposedModule() {
         // startup report instead: same reader, same moment, and the startup line
         // is already the one naming the generation a hot-reload check looks at.
         val intervalMin = GMS_TRAFFIC_PROBE_INTERVAL_MS / 60_000
-        probeBackgroundHandler().post {
+        probeBackgroundHandler()?.post {
             probeGmsTraffic("startup, read-only, every ${intervalMin}min, gen $generation")
         }
-        probeBackgroundHandler().postDelayed(object : Runnable {
+        probeBackgroundHandler()?.postDelayed(object : Runnable {
             override fun run() {
-                if (latestTrafficProbeGeneration() != generation) {
+                if (retired || latestTrafficProbeGeneration() != generation) {
                     log(
                         Log.INFO, TAG,
                         "gms probe: chain generation $generation superseded, " +
@@ -4429,7 +4450,7 @@ class Hooker : XposedModule() {
                     return
                 }
                 probeGmsTraffic("periodic")
-                probeBackgroundHandler().postDelayed(this, GMS_TRAFFIC_PROBE_INTERVAL_MS)
+                probeBackgroundHandler()?.postDelayed(this, GMS_TRAFFIC_PROBE_INTERVAL_MS)
             }
         }, GMS_TRAFFIC_PROBE_INTERVAL_MS)
     }
@@ -4453,6 +4474,7 @@ class Hooker : XposedModule() {
         System.getProperties().getProperty(TRAFFIC_PROBE_GENERATION_KEY)?.toLongOrNull() ?: 0L
 
     private fun probeGmsTraffic(reason: String) {
+        if (retired) return
         // One line per tick. The gate counters and the traffic delta come off the
         // same timer and answer the same question — "did anything get gated, and
         // is GMS still talking" — yet this function used to print them as two
@@ -4549,18 +4571,11 @@ class Hooker : XposedModule() {
     @Volatile
     private var lastGmsTxBytes = -1L
 
-    private fun probeBackgroundHandler(): Handler {
-        val handler = probeHandler
-        if (handler != null) {
-            return handler
-        }
-        synchronized(this) {
-            if (probeHandler == null) {
-                val thread = HandlerThread("fcmlive-probe")
-                thread.start()
-                probeHandler = Handler(thread.looper)
-            }
-            return probeHandler!!
+    private fun probeBackgroundHandler(): Handler? = synchronized(workerLock) {
+        if (retired) return null
+        probeHandler ?: HandlerThread("fcmlive-probe").let { thread ->
+            thread.start()
+            Handler(thread.looper).also { probeHandler = it }
         }
     }
 

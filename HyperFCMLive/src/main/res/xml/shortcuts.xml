@@ -13,9 +13,9 @@
         android:shortcutShortLabel="@string/shortcut_settings"
         android:shortcutLongLabel="@string/shortcut_settings_long">
         <intent
-            android:action="android.intent.action.VIEW"
+            android:action="io.github.howard20181.hyperos.fcmlive.APP_SETTINGS"
             android:targetPackage="io.github.howard20181.hyperos.fcmlive"
-            android:targetClass="io.github.howard20181.hyperos.fcmlive.AboutActivity" />
+            android:targetClass="io.github.howard20181.hyperos.fcmlive.MainActivity" />
     </shortcut>
 
     <shortcut

@@ -141,7 +141,8 @@ object ThemePrefs {
             MODE_LIGHT -> false
             MODE_DARK, MODE_AMOLED -> true
             else -> {
-                val mask = context.resources.configuration.uiMode and
+                // Activity 的配置可能被 attach 强制覆盖；跟随系统须读未覆盖的应用配置。
+                val mask = context.applicationContext.resources.configuration.uiMode and
                     Configuration.UI_MODE_NIGHT_MASK
                 mask == Configuration.UI_MODE_NIGHT_YES
             }

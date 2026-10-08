@@ -29,7 +29,7 @@ internal object RootDiagnosticsReader {
         }
     }
 
-    private fun read(shell: Shell, source: String, command: String): Evidence {
+    internal fun read(shell: Shell, source: String, command: String): Evidence {
         val out = BoundedLines()
         val err = BoundedLines()
         var future: java.util.concurrent.Future<Shell.Result>? = null
@@ -66,37 +66,37 @@ internal object RootDiagnosticsReader {
         } catch (e: Exception) {
             return unavailable("Root shell 建立失败：${e.javaClass.simpleName}：${e.message}")
         }
+        val deadline = SystemClock.elapsedRealtime() + 30_000L
+        fun read(source: String, command: String): Evidence =
+            if (SystemClock.elapsedRealtime() >= deadline) Evidence(source, null, emptyList(), "达到本次检测时间上限，未读取")
+            else RootDiagnosticsReader.read(shell, source, command)
         try {
-            val identity = read(shell, "Root 身份", "id -u")
+            val identity = read("Root 身份", "id -u")
             evidence += identity
             if (!identity.ok || identity.lines.singleOrNull()?.trim() != "0") {
                 return unavailable("未取得 UID 0：${identity.summary()}。请在 Root 管理器授权后重试。")
             }
-            val ps = read(shell, "进程表", "ps -A -o UID,PID,NAME")
-            val tcp4 = read(shell, "IPv4 socket 表", "cat /proc/net/tcp")
-            val tcp6 = read(shell, "IPv6 socket 表", "cat /proc/net/tcp6")
+            val ps = read("进程表", "ps -A -o UID,PID,NAME")
+            val tcp4 = read("IPv4 socket 表", "cat /proc/net/tcp")
+            val tcp6 = read("IPv6 socket 表", "cat /proc/net/tcp6")
             val sampledAt = System.currentTimeMillis()
-            val greezer = read(shell, "greeze 策略", "dumpsys -t 5 greezer")
-            val boot = read(shell, "启动标识", "cat /proc/sys/kernel/random/boot_id")
-            val millet = read(shell, "MILLET 免限名单", "settings get system MILLET_NO_RESTRICT_APP")
-            val aurogon = read(shell, "Aurogon 门控", "settings get global aurogon_enable")
-            val deviceIdle = read(shell, "Doze 白名单", "dumpsys deviceidle whitelist")
+            val greezer = read("greeze 策略", "dumpsys -t 5 greezer")
+            val boot = read("启动标识", "cat /proc/sys/kernel/random/boot_id")
+            val millet = read("MILLET 免限名单", "settings --user 0 get system MILLET_NO_RESTRICT_APP")
+            val aurogon = read("Aurogon 门控", "settings get global aurogon_enable")
+            val deviceIdle = read("Doze 白名单", "dumpsys deviceidle whitelist")
             evidence += listOf(ps, tcp4, tcp6, greezer, boot, millet, aurogon, deviceIdle)
-            val processes = if (ps.ok && uid != null) DiagnosticsParser.allGmsProcesses(ps.lines) else null
-            val v4 = if (tcp4.ok && uid != null) DiagnosticsParser.sockets(tcp4.lines, uid) else null
-            val v6 = if (tcp6.ok && uid != null) DiagnosticsParser.sockets(tcp6.lines, uid) else null
-            // 主用户 socket + 所有用户的推送端口连接合并：分身/工作资料的 GMS
-            // 是独立 UID，只按当前用户匹配会把它们的连接漏掉。
-            val allV4 = if (tcp4.ok) DiagnosticsParser.allGmsSockets(tcp4.lines) else null
-            val allV6 = if (tcp6.ok) DiagnosticsParser.allGmsSockets(tcp6.lines) else null
-            val sockets = if (v4 == null && v6 == null && allV4 == null && allV6 == null) null
-                else (v4.orEmpty() + v6.orEmpty() + allV4.orEmpty() + allV6.orEmpty())
-                    .distinctBy { it.key }
-                    .ifEmpty { null }
+            val processRows = if (ps.ok && uid != null) DiagnosticsParser.allGmsProcesses(ps.lines, uid) else null
+            val verifiedUids = processRows.orEmpty().map { it.uid }.toSet() + listOfNotNull(uid)
+            val processes = processRows?.map { it.display }
+            val v4 = if (tcp4.ok) DiagnosticsParser.allGmsSockets(tcp4.lines, verifiedUids) else null
+            val v6 = if (tcp6.ok) DiagnosticsParser.allGmsSockets(tcp6.lines, verifiedUids) else null
+            val sockets = if (v4 == null && v6 == null) null
+                else (v4.orEmpty() + v6.orEmpty()).distinctBy { it.key }
 
             // 仅枚举已知的当前日志目录，不递归读取其他模块的私有数据。
-            val paths = read(shell, "LSPosed 日志定位", """
-                for d in /data/adb/lspd/log /data/adb/lsposed/log; do
+            val paths = read("LSPosed 日志定位", """
+                for d in /data/adb/lspd/log /data/adb/lspd/log.old /data/adb/lsposed/log /data/adb/lsposed/log.old; do
                     if [ -d "${'$'}d" ]; then
                         for f in "${'$'}d"/modules*.log; do
                             [ -f "${'$'}f" ] && printf '%s\n' "${'$'}f"
@@ -106,16 +106,15 @@ internal object RootDiagnosticsReader {
                 true
             """.trimIndent())
             evidence += paths
-            val allowed = Regex("/data/adb/(?:lspd|lsposed)/log/modules[A-Za-z0-9_.:+-]*\\.log")
-            // 7 天统计需要覆盖多份历史日志；LSPosed 按开机/轮转滚动文件，
-            // 取最近 20 份、每份尾部 3000 行。尾部足够：推送门控行分散在文件中，
-            // 但 20 份 × 3000 行的窗口在正常日志量下能覆盖数天的记录。
-            val candidates = paths.lines.filter { allowed.matches(it) }.distinct().sortedDescending().take(20)
+            val allowed = Regex("/data/adb/(?:lspd|lsposed)/log(?:\\.old)?/modules[A-Za-z0-9_.:+-]*\\.log")
+            // 只读取有预算的现存片段，不能假定 LSPosed 保留了完整七天。
+            val candidates = paths.lines.filter { allowed.matches(it) }.distinct()
+                .sortedByDescending { it.substringAfterLast('/') }.take(20)
             val records = mutableListOf<ModuleLogParser.Line>()
             val sources = mutableListOf<String>()
             var readable = false
             for (path in candidates) {
-                val part = read(shell, path, "tail -n 3000 '$path'")
+                val part = read(path, "tail -n 3000 '$path'")
                 evidence += part
                 if (part.ok) {
                     readable = true
@@ -125,7 +124,7 @@ internal object RootDiagnosticsReader {
             }
             // 某些框架将日志经 LSPosedFramework 标签写入 logcat；不能只过滤 HyperGreeze。
             if (records.isEmpty()) {
-                val fallback = read(shell, "logcat 回退", "logcat -b all -d -v threadtime -t 3000 -s LSPosedFramework LSPosed-Bridge HyperGreeze")
+                val fallback = read("logcat 回退", "logcat -b all -d -v threadtime -t 3000 -s LSPosedFramework LSPosed-Bridge HyperGreeze")
                 evidence += fallback
                 if (fallback.ok) {
                     readable = true
@@ -133,9 +132,11 @@ internal object RootDiagnosticsReader {
                     records += ModuleLogParser.parseAll(fallback.lines)
                 }
             }
-            val log = LogRead(records.distinctBy { it.raw }.sortedBy { it.stamp }, readable,
+            val (history, historyNote) = LogHistory.collect(context, records, sampledAt)
+            val undated = records.filter { ModuleLogParser.epochMillis(it) == null }
+            val log = LogRead((history + undated).distinctBy { it.raw }, readable,
                 (sources.ifEmpty { listOf("未取得可读的模块日志") }).joinToString("\n") +
-                    "\n只读取近期日志片段，不代表完整历史。")
+                    "\n每份最多读取末 3000 行，读取失败或被截断的历史可能缺失。\n" + historyNote)
             // 报告只保留该模块和 GMS 的数据，不复制整机 ps 或其他应用的 socket。
             val report = buildString {
                 appendLine("网络采样时间：${java.time.Instant.ofEpochMilli(sampledAt)}")
@@ -164,8 +165,8 @@ internal object RootDiagnosticsReader {
                 bootEpoch, sampledAt, true, report, v4 != null && v6 != null,
                 if (millet.ok) DiagnosticsParser.milletContainsGms(millet.lines) else null,
                 if (aurogon.ok) DiagnosticsParser.aurogonConfigured(aurogon.lines) else null,
-                if (deviceIdle.ok) DiagnosticsParser.deviceIdleGms(deviceIdle.lines)?.first else null
-            ), log)
+                if (deviceIdle.ok) DiagnosticsParser.deviceIdleGms(deviceIdle.lines)?.first else null,
+                verifiedUids, processRows), log)
         } finally {
             runCatching { shell.close() }
         }
