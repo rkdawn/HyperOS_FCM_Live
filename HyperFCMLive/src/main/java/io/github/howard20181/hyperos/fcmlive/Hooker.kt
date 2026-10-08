@@ -1212,24 +1212,9 @@ class Hooker : XposedModule() {
                 ) {
                     return@intercept true
                 }
-                // Experiment: the branch above is the shipped GMS→c2dm hop. This
-                // one drops its caller/action restriction for push broadcasts to
-                // a package the user checked — the two reference modules answer
-                // this method from the intent alone and never look at the caller.
-                // Deliberately narrower than they are: the target must be
-                // *explicitly* allowlisted, so an empty list cannot turn this
-                // into a whole-device gate bypass. The action test comes first
-                // because it is local and rejects almost every broadcast the
-                // system asks about, which keeps the remote-prefs read below off
-                // the hot path.
-                if (intent != null &&
-                    targetPackage != null &&
-                    isPushAction(intent.action) &&
-                    isWakeAutostartRelaxedEnabled() &&
-                    wakeExplicitlyAllows(targetPackage)
-                ) {
-                    return@intercept true
-                }
+                // 上游 3.7.0 结论：真实 FCM 广播的 caller 恒为 GMS，上面那条
+                // GMS→c2dm 跳线已经覆盖所有本模块关心的广播；曾在此放宽
+                // caller 限制的实验分支覆盖不到额外路径，已删除。
             } catch (e: Exception) {
                 log(
                     Log.ERROR, TAG,
@@ -3916,74 +3901,13 @@ class Hooker : XposedModule() {
                     log(Log.ERROR, TAG, "C2DM broadcast hook failed", t)
                 }
             }
-            // Experiment: stopped-package delivery for the packages the user
-            // checked, not only the GMS→c2dm hop above. Same flag, same exit,
-            // wider caller set — the caller check that guards the hop is
-            // deliberately absent here, because a sender other than GMS is
-            // exactly what this switch is for.
-            //
-            // The list gate is [wakeExplicitlyAllows], not `moduleAppliesTo`.
-            // The two differ in exactly the ways this pair's description would
-            // otherwise lie about: `moduleAppliesTo(Tier.WAKE)` fails open on an
-            // empty list (so a fresh install with nothing checked would have the
-            // flag added to broadcasts aimed at *every* package) and exempts GMS
-            // unconditionally. Both are right for the shipped wake privileges,
-            // whose posture is a whole-device FCM fix, and both are wrong for a
-            // switch whose description says "only the checked apps". The second
-            // wake pair is gated the same way, so the two rows one section apart
-            // now mean the same thing.
-            //
-            // ponytail: the flag is added and nothing else about the broadcast
-            //   changes — no appOp rewrite, no ordered-broadcast promotion, no
-            //   resultTo, no new permission. Cost: a broadcast the ROM still
-            //   refuses for some other reason (a permission, a MIUI policy, an
-            //   app whose receivers are disabled) stays refused. Condition to
-            //   add more: a sample of "allowlisted, flag present, still not
-            //   delivered".
-            //
-            // ponytail: this used to also reset the package's stopped state
-            //   (`setPackageStoppedState(pkg, false, userId)`) behind a second
-            //   opt-in. Removed as provably redundant: the flag added here opens
-            //   the very gate the reset was meant to open. ROM bytecode
-            //   (OS4.0.0.33 / myron): `broadcastIntentLockedTraced` adds
-            //   FLAG_EXCLUDE_STOPPED_PACKAGES unconditionally, and
-            //   `IntentResolver#buildResolveList` filters stopped packages only
-            //   when `Intent.isExcludingStopped()` holds, which is compiled to
-            //   `(mFlags & 0x30) == 0x10` — i.e. EXCLUDE set *and* INCLUDE clear.
-            //   So with this flag present the receiver is resolved, the broadcast
-            //   is delivered, and PackageManager clears stopped on delivery; the
-            //   reset never made a difference on any broadcast that reaches here.
-            //   Cost of the removal: a broadcast the module never sees (an alarm,
-            //   a PendingIntent, an internal call straight into
-            //   `broadcastIntentLocked`) is still filtered out for a stopped
-            //   package, and there is no longer anything undoing that. Condition
-            //   to bring it back: a sample of an allowlisted package blocked by
-            //   stopped on such a path — not a binder-dispatched one.
-            if (intent != null && isWakeStoppedPackagesEnabled()) {
-                try {
-                    val wakePackage = targetPackageOf(intent)
-                    if (wakePackage != null && wakeExplicitlyAllows(wakePackage)) {
-                        try {
-                            if ((intent.flags and Intent.FLAG_INCLUDE_STOPPED_PACKAGES) == 0) {
-                                intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                            }
-                        } catch (t: Throwable) {
-                            log(
-                                Log.ERROR, TAG,
-                                "wake: failed to add FLAG_INCLUDE_STOPPED_PACKAGES", t
-                            )
-                        }
-                    }
-                } catch (t: Throwable) {
-                    log(Log.ERROR, TAG, "Wake broadcast hook failed", t)
-                }
-            }
-            // Experiment: the autostart pair's persistent half. Same targeted
-            // push and same explicit-allowlist gate as the master's runtime
-            // bypass, but instead of answering a gate it writes the ROM's own
-            // autostart AppOp for the package — see maybeWriteAutostart. The
-            // action test is the cheap local one, so the remote-prefs read only
-            // happens for a push broadcast.
+            // 上游 3.7.0 结论：FLAG_INCLUDE_STOPPED_PACKAGES 对非 GMS 调用方的
+            // 补加分支覆盖不到任何真实 FCM 广播（caller 恒为 GMS，已由上面
+            // 的 GMS→c2dm 跳线处理），实验分支已删除。GMS→c2dm 跳线保留。
+            // Experiment: the autostart switch's persistent write. It writes the
+            // ROM's own autostart AppOp for the package — see maybeWriteAutostart.
+            // The action test is the cheap local one, so the remote-prefs read
+            // only happens for a push broadcast.
             if (intent != null && isPushAction(intent.action)) {
                 try {
                     val autostartPackage = targetPackageOf(intent)
@@ -4013,56 +3937,17 @@ class Hooker : XposedModule() {
     }
 
     /**
-     * Experiment master switch: stopped-package delivery (see the branch in
-     * [hookActivityManagerService]).
+     * Experiment switch: write the package's autostart op (independent, no
+     * master). 上游 3.7.0 将其从 pair 中独立：原 master 的运行时分支覆盖不到
+     * 额外路径已删，写盘这半保留为独立开关。
      *
-     * Fails to *disabled*: stopped-state delivery is a protection the user or a
-     * freeze tool asked for, and an unreadable switch must leave the ROM's own
-     * delivery decision alone rather than adding flags on the strength of a
-     * value nobody could read.
-     */
-    private fun isWakeStoppedPackagesEnabled(): Boolean {
-        return try {
-            getRemotePreferences(Prefs.GROUP_CONFIG)
-                .getBoolean(Prefs.KEY_WAKE_STOPPED_PACKAGES, false)
-        } catch (ignored: Throwable) {
-            false
-        }
-    }
-
-    /**
-     * Experiment master switch: relax the autostart gate (see the second branch
-     * in [hookBroadcastQueueModernStubImpl]).
-     *
-     * Fails to *disabled*. The autostart decision is the ROM's, and an
-     * unreadable switch must leave it alone rather than start answering every
-     * push broadcast from a value nobody could read.
-     */
-    private fun isWakeAutostartRelaxedEnabled(): Boolean {
-        return try {
-            getRemotePreferences(Prefs.GROUP_CONFIG)
-                .getBoolean(Prefs.KEY_WAKE_AUTOSTART_RELAXED, false)
-        } catch (ignored: Throwable) {
-            false
-        }
-    }
-
-    /**
-     * Experiment sub-switch: write the package's autostart op.
-     *
-     * [Prefs.KEY_WAKE_AUTOSTART_RELAXED] is the master of this pair, so the
-         * write happens only while the master is on as well: turning the master off
-         * must not leave a hook writing a user-visible setting behind a control the
-         * user can no longer see. The stored sub-value is kept, so turning the
-         * master back on restores the last choice.
-     *
-     * Fails to *disabled* for the same reason as the master.
+     * Fails to *disabled*: an unreadable switch must not leave a hook writing
+     * a user-visible setting on the strength of a value nobody could read.
      */
     private fun isWakeWriteAutostartEnabled(): Boolean {
         return try {
-            val config = getRemotePreferences(Prefs.GROUP_CONFIG)
-            config.getBoolean(Prefs.KEY_WAKE_AUTOSTART_RELAXED, false) &&
-                config.getBoolean(Prefs.KEY_WAKE_WRITE_AUTOSTART, false)
+            getRemotePreferences(Prefs.GROUP_CONFIG)
+                .getBoolean(Prefs.KEY_WAKE_WRITE_AUTOSTART, false)
         } catch (ignored: Throwable) {
             false
         }
@@ -4248,11 +4133,29 @@ class Hooker : XposedModule() {
             val current =
                 getInvoker(checkOpNoThrow).invoke(appOps, MIUIOP_AUTO_START, uid, packageName)
             if (current == AppOpsManager.MODE_ALLOWED) {
-                return AUTOSTART_ALREADY
+                // 行为位已开，但开关位可能仍是关闭（旧版本只写过 10008）。
+                // 补齐开关位后即视为已允许，避免管家页面显示与实际不符。
+                val switchCurrent = runCatching {
+                    getInvoker(checkOpNoThrow).invoke(appOps, MIUIOP_AUTO_START_SWITCH, uid, packageName)
+                }.getOrNull()
+                if (switchCurrent == AppOpsManager.MODE_ALLOWED) return AUTOSTART_ALREADY
+                getInvoker(setMode).invoke(
+                    appOps, MIUIOP_AUTO_START_SWITCH, uid, packageName, AppOpsManager.MODE_ALLOWED
+                )
+                return AUTOSTART_WRITTEN
             }
             getInvoker(setMode).invoke(
                 appOps, MIUIOP_AUTO_START, uid, packageName, AppOpsManager.MODE_ALLOWED
             )
+            // 开关位伴随行为位一起写；某些 ROM 对 10053 校验更严，失败不回滚 10008，
+            // 只记录——实际行为（允许自启动）已达成。
+            runCatching {
+                getInvoker(setMode).invoke(
+                    appOps, MIUIOP_AUTO_START_SWITCH, uid, packageName, AppOpsManager.MODE_ALLOWED
+                )
+            }.onFailure { t ->
+                log(Log.WARN, TAG, "wake: autostart switch op ($MIUIOP_AUTO_START_SWITCH) write failed for $packageName", t)
+            }
             return AUTOSTART_WRITTEN
         } catch (t: Throwable) {
             log(Log.ERROR, TAG, "wake: failed to write the autostart op of $packageName", t)
@@ -5228,6 +5131,14 @@ class Hooker : XposedModule() {
          * Not an AOSP op: the MIUI range starts at 10000.
          */
         private const val MIUIOP_AUTO_START = 10008
+
+        /**
+         * MIUI's autostart *switch* op — the one 手机管家's app-management page
+         * reads and displays. 10008 是行为位；10053 是开关位。只写 10008 时应用
+         * 已被允许自启动，但管家页面仍显示关闭，用户会误以为没有生效
+         * （上游 3.7.0 变更说明）。两者随写随读、同开同关。
+         */
+        private const val MIUIOP_AUTO_START_SWITCH = 10053
 
         /**
          * Outcomes of [writeAutostartIfNeeded]. Ints rather than an enum so the

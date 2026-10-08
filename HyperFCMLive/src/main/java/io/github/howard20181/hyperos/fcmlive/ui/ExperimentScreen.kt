@@ -107,12 +107,6 @@ private fun ExperimentBody(
     var sleepKeepaliveData by remember {
         mutableStateOf(Prefs.readLocalSleepKeepaliveData(context))
     }
-    var wakeStoppedPackages by remember {
-        mutableStateOf(Prefs.readLocalWakeStoppedPackages(context))
-    }
-    var wakeAutostartRelaxed by remember {
-        mutableStateOf(Prefs.readLocalWakeAutostartRelaxed(context))
-    }
     var wakeWriteAutostart by remember {
         mutableStateOf(Prefs.readLocalWakeWriteAutostart(context))
     }
@@ -224,60 +218,22 @@ private fun ExperimentBody(
             )
         }
         item {
-            SectionTitle(R.string.experiment_section_wake)
-            SettingsSwitchCard(
-                iconRes = R.drawable.ic_campaign,
-                title = stringResource(R.string.experiment_wake_stopped_packages),
-                description = stringResource(R.string.experiment_wake_stopped_packages_desc),
-                checked = wakeStoppedPackages,
-                onCheckedChange = { checked ->
-                    Prefs.writeWakeStoppedPackages(context, Prefs.remote(), checked)
-                    wakeStoppedPackages = checked
-                },
-            )
-        }
-        item {
-            // A section of its own rather than a second row under "唤醒". The two
-            // answer different ROM gates on the same broadcast path — the AOSP
-            // stopped state above, the MIUI autostart AppOp here — and they
-            // disagree on every property a reader would group them by: what
-            // triggers the persistent write, which broadcasts are reached, and
-            // whether a user-visible setting ends up changed. Under one heading,
-            // with their corners left open so the rows connect, they read as one
-            // feature escalating in strength.
+            // 上游 3.7.0：删除「投递广播到已停止的应用」——真实 FCM 广播
+            // caller 恒为 GMS，已由固定的 GMS→c2dm 跳线处理，该开关覆盖不到
+            // 额外路径，属冗余。「放宽自启动检查」同理删除。
             SectionTitle(R.string.experiment_section_autostart)
             SettingsSwitchCard(
-                iconRes = R.drawable.ic_policy,
-                title = stringResource(R.string.experiment_wake_autostart_relaxed),
-                description = stringResource(R.string.experiment_wake_autostart_relaxed_desc),
-                checked = wakeAutostartRelaxed,
+                iconRes = R.drawable.ic_key,
+                title = stringResource(R.string.experiment_wake_autostart_write),
+                description = stringResource(R.string.experiment_wake_autostart_write_desc),
+                checked = wakeWriteAutostart,
                 onCheckedChange = { checked ->
-                    Prefs.writeWakeAutostartRelaxed(context, Prefs.remote(), checked)
-                    wakeAutostartRelaxed = checked
+                    Prefs.writeWakeWriteAutostart(context, Prefs.remote(), checked)
+                    wakeWriteAutostart = checked
                 },
-                last = !wakeAutostartRelaxed
+                first = true,
+                last = true
             )
-            AnimatedVisibility(
-                visible = wakeAutostartRelaxed,
-                enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
-                exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut()
-            ) {
-                Column {
-                    Spacer(modifier = Modifier.height(GROUP_ROW_GAP))
-                    SettingsSwitchCard(
-                        iconRes = R.drawable.ic_key,
-                        title = stringResource(R.string.experiment_wake_autostart_write),
-                        description = stringResource(R.string.experiment_wake_autostart_write_desc),
-                        checked = wakeWriteAutostart,
-                        onCheckedChange = { checked ->
-                            Prefs.writeWakeWriteAutostart(context, Prefs.remote(), checked)
-                            wakeWriteAutostart = checked
-                        },
-                        first = false,
-                        last = true
-                    )
-                }
-            }
         }
         // The same 16dp tail the settings page ends on, so the last card does
         // not sit flush against the gesture strip on a fully scrolled page.

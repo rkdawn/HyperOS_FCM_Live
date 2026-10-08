@@ -257,51 +257,33 @@ object Prefs {
      * protection the user or a freeze tool asked for, and the flag is added
      * before the ROM's own delivery decision rather than after it.
      */
-    const val KEY_WAKE_STOPPED_PACKAGES = "wake_stopped_packages"
+    /**
+     * 已删除的实验开关（键名保留用于清理旧镜像数据，不再读写）：
+     * - `wake_stopped_packages`（上游 3.7.0 删除）：真实 FCM 广播 caller 恒为
+     *   GMS，固定的 GMS→c2dm 跳线已覆盖；本开关补加 FLAG 的分支覆盖不到任何
+     *   额外广播。
+     * - `wake_autostart_relaxed`（上游 3.7.0 删除）：同因。其唯一存活价值
+     *   （持久写盘）已并入 [KEY_WAKE_WRITE_AUTOSTART]。
+     */
+    private const val KEY_WAKE_STOPPED_PACKAGES = "wake_stopped_packages"
     /** UI-only: set while the mirror holds a wake change the module never saw. */
     private const val KEY_WAKE_STOPPED_PACKAGES_PENDING_PUSH =
         "wake_stopped_packages_pending_push"
 
-    /**
-     * Remote + local: "relax the autostart gate" experiment — the master switch
-     * of the second wake pair.
-     *
-     * Where the first pair works on the *stopped* state, this one works on the
-     * MIUI *autostart* gate. `BroadcastQueueModernStubImpl#checkApplicationAutoStart`
-     * runs before a broadcast is delivered, and on this ROM it ends in
-     * `WakePathChecker#isAllowedByWakePathRule`, which reads the MIUI autostart
-     * AppOp (`MIUIOP 10008`). The shipped module already answers that method
-     * for the GMS→c2dm hop only (caller is GMS and the action is c2dm); this
-     * switch drops the caller/action restriction and lets any *push* broadcast
-     * through, which is what the two reference modules do — both answer the
-     * method from the intent alone and never look at the caller.
-     *
-     * Narrower than the reference modules on purpose: the target must be a
-     * package the user actually checked (see [KEY_ALLOWLIST]), and the intent
-     * must be a push action aimed at a named package. An empty allowlist
-     * therefore means "no app", not "every app".
-     *
-     * Nothing is written to disk by this one: it answers a gate for a broadcast
-     * already in flight. The op itself is [KEY_WAKE_WRITE_AUTOSTART]'s job.
-     *
-     * Default **off**: this is the module reaching past the FCM chain it exists
-     * for, so it stays a deliberate choice.
-     */
-    const val KEY_WAKE_AUTOSTART_RELAXED = "wake_autostart_relaxed"
-    /** UI-only: set while the mirror holds an autostart-relaxed change the module never saw. */
+    /** 同上，已删除的实验开关键名；仅存在于旧镜像数据。 */
+    private const val KEY_WAKE_AUTOSTART_RELAXED = "wake_autostart_relaxed"
     private const val KEY_WAKE_AUTOSTART_RELAXED_PENDING_PUSH =
         "wake_autostart_relaxed_pending_push"
 
     /**
-     * Remote + local: "write the autostart permission" sub-switch.
+     * Remote + local: "write the autostart permission" switch（独立开关，上游
+     * 3.7.0 起不再是 relaxed 的子项）。
      *
-     * Only consulted while [KEY_WAKE_AUTOSTART_RELAXED] is on, and for the same
-     * explicitly checked packages. Where the master merely lets one broadcast
-     * through, this writes the ROM's own AppOp: the MIUI autostart op
-     * (`10008`) is set to `MODE_ALLOWED` for the package, which is exactly what
-     * `android.miui.AppOpsUtils#setApplicationAutoStart(ctx, pkg, true)` does
-     * — the package then passes `WakePathChecker#isAllowedByWakePathRule` for
-     * every later broadcast too, including the ones the module never sees.
+     * 对显式勾选的应用，把 MIUI 自启动行为位（`10008`）和开关位（`10053`，
+     * 手机管家应用管理页显示的那个）都写为 `MODE_ALLOWED` —— 与
+     * `android.miui.AppOpsUtils#setApplicationAutoStart(ctx, pkg, true)` 等效。
+     * 旧版本只写 10008：应用实际已被允许自启动，但管家页面仍显示关闭，
+     * 造成"没生效"的错觉（上游 3.7.0 变更说明）。
      *
      * The write happens on two occasions. Turning the switch **on** applies it
      * to the whole allowlist at once — the app broadcasts
@@ -319,7 +301,7 @@ object Prefs {
      * the switch is turned off — nothing in the module knows what the value was
      * before.
      *
-     * Default **off**, same reasoning as the master switch.
+     * Default **off**, same reasoning as every other experiment.
      */
     const val KEY_WAKE_WRITE_AUTOSTART = "wake_write_autostart"
     /** UI-only: set while the mirror holds an autostart-write change the module never saw. */
@@ -368,8 +350,8 @@ object Prefs {
         if (hasPendingWifiWeakSignalFloorPush(context)) writeWifiWeakSignalFloor(context, remote, readLocalWifiWeakSignalFloor(context))
         if (hasPendingSleepKeepalivePush(context)) writeSleepKeepalive(context, remote, readLocalSleepKeepalive(context))
         if (hasPendingSleepKeepaliveDataPush(context)) writeSleepKeepaliveData(context, remote, readLocalSleepKeepaliveData(context))
-        if (hasPendingWakeStoppedPackagesPush(context)) writeWakeStoppedPackages(context, remote, readLocalWakeStoppedPackages(context))
-        if (hasPendingWakeAutostartRelaxedPush(context)) writeWakeAutostartRelaxed(context, remote, readLocalWakeAutostartRelaxed(context))
+        // wake_stopped_packages / wake_autostart_relaxed 已删除（上游 3.7.0）：
+        // 不再补交；旧 pending 标记随本地镜像数据一并失效。
         if (hasPendingWakeWriteAutostartPush(context)) writeWakeWriteAutostart(context, remote, readLocalWakeWriteAutostart(context))
     }
 
@@ -593,63 +575,7 @@ object Prefs {
         writeConfig(context, remotePrefs, KEY_WIFI_WEAK_SIGNAL_FLOOR, KEY_WIFI_WEAK_SIGNAL_FLOOR_PENDING_PUSH, value)
     }
 
-    /** Wake master-switch value as the UI last left it; the mirror is what the experiment screen shows. */
-    @JvmStatic
-    fun readLocalWakeStoppedPackages(context: Context): Boolean {
-        return localPrefs(context).getBoolean(KEY_WAKE_STOPPED_PACKAGES, false)
-    }
-
-    /** Wake counterpart of [hasPendingPush]. */
-    @JvmStatic
-    fun hasPendingWakeStoppedPackagesPush(context: Context): Boolean {
-        return localPrefs(context).getBoolean(KEY_WAKE_STOPPED_PACKAGES_PENDING_PUSH, false)
-    }
-
-    /**
-     * Write the wake master switch and make it live.
-     *
-     * Same shape as [writeSleepKeepalive]. The hook lives in system_server and
-     * reads the remote value lazily at each qualifying broadcast, so flipping
-     * this takes effect on the next broadcast without a reload.
-     */
-    @JvmStatic
-    fun writeWakeStoppedPackages(
-        context: Context,
-        remotePrefs: SharedPreferences?,
-        enabled: Boolean
-    ) {
-        writeConfig(context, remotePrefs, KEY_WAKE_STOPPED_PACKAGES, KEY_WAKE_STOPPED_PACKAGES_PENDING_PUSH, enabled)
-    }
-
-    /** Autostart-relaxed master switch value as the UI last left it. */
-    @JvmStatic
-    fun readLocalWakeAutostartRelaxed(context: Context): Boolean {
-        return localPrefs(context).getBoolean(KEY_WAKE_AUTOSTART_RELAXED, false)
-    }
-
-    /** Autostart-relaxed counterpart of [hasPendingPush]. */
-    @JvmStatic
-    fun hasPendingWakeAutostartRelaxedPush(context: Context): Boolean {
-        return localPrefs(context).getBoolean(KEY_WAKE_AUTOSTART_RELAXED_PENDING_PUSH, false)
-    }
-
-    /**
-     * Write the autostart-relaxed master switch and make it live.
-     *
-     * Same shape as [writeWakeStoppedPackages]: the hook lives in system_server
-     * and reads the remote value lazily at each qualifying broadcast, so
-     * flipping this takes effect on the next one without a reload.
-     */
-    @JvmStatic
-    fun writeWakeAutostartRelaxed(
-        context: Context,
-        remotePrefs: SharedPreferences?,
-        enabled: Boolean
-    ) {
-        writeConfig(context, remotePrefs, KEY_WAKE_AUTOSTART_RELAXED, KEY_WAKE_AUTOSTART_RELAXED_PENDING_PUSH, enabled)
-    }
-
-    /** Autostart-write sub-switch value as the UI last left it. */
+    /** Autostart-write switch value as the UI last left it. */
     @JvmStatic
     fun readLocalWakeWriteAutostart(context: Context): Boolean {
         return localPrefs(context).getBoolean(KEY_WAKE_WRITE_AUTOSTART, false)
@@ -662,11 +588,13 @@ object Prefs {
     }
 
     /**
-     * Write the autostart-write sub-switch and make it live.
+     * Write the autostart-write switch and make it live.
      *
-     * Same shape as [writeWakeStoppedPackages], and gated the same way: the
-     * stored value is kept, but the hook reads it only while the master is on,
-     * so nothing is written while the control is hidden.
+     * Turning it on applies the write to the whole allowlist at once (via
+     * [ACTION_APPLY_AUTOSTART]) so the row takes effect on the spot. Turning
+     * it off deliberately leaves what was already written alone — nothing in
+     * the module knows what the values were before; undo is 手动到手机管家
+     * 拨动一次该应用的自启动开关.
      */
     @JvmStatic
     fun writeWakeWriteAutostart(
@@ -675,11 +603,6 @@ object Prefs {
         enabled: Boolean
     ) {
         writeConfig(context, remotePrefs, KEY_WAKE_WRITE_AUTOSTART, KEY_WAKE_WRITE_AUTOSTART_PENDING_PUSH, enabled) {
-            // Turning the pair on is the one moment the user is looking at this
-            // row, so the write is applied to the whole allowlist now rather
-            // than whenever each app happens to receive its next push. Sent only
-            // when enabling: turning it off deliberately leaves what was already
-            // written alone, and the module never learns the previous values.
             if (enabled) broadcastApplyAutostart(appContext(context))
         }
     }

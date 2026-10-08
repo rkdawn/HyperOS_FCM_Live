@@ -10,10 +10,48 @@ internal data class LogExplanation(
     val needsAttention: Boolean = false
 ) {
     val text get() = "发生了什么：$happened\n有什么影响：$impact\n你需要做：$advice"
+
+    /** 时间线单行摘要："做了什么"，不带建议，供逐条浏览。 */
+    val summary get() = when {
+        happened.endsWith("。") -> happened.removeSuffix("。")
+        else -> happened
+    }
 }
 
 internal data class ExplainedLogGroup(val explanation: LogExplanation, val records: List<ModuleLogParser.Line>)
 
+/**
+ * 时间线分组：输入必须已按时间升序。相邻且同类（kind 相同）的记录合并为一段，
+ * 跨类或时间断开（>10 分钟）即分段。保留了用户要的"什么时间干了什么"的顺序感。
+ */
+internal fun explainedTimeline(lines: List<ModuleLogParser.Line>): List<ExplainedLogGroup> {
+    val output = mutableListOf<ExplainedLogGroup>()
+    var currentKind: String? = null
+    var bucket = mutableListOf<ModuleLogParser.Line>()
+    fun flush() {
+        if (bucket.isNotEmpty()) {
+            output += ExplainedLogGroup(interpretLogEvent(bucket.last()), bucket.toList())
+            bucket = mutableListOf()
+        }
+    }
+    for (line in lines.distinctBy { it.raw }.sortedBy { it.stamp }) {
+        val kind = interpretLogEvent(line).kind
+        val gap = bucket.lastOrNull()?.let { last ->
+            (ModuleLogParser.epochMillis(line) ?: 0L) - (ModuleLogParser.epochMillis(last) ?: 0L)
+        } ?: 0L
+        if (kind != currentKind || gap > TIMELINE_MERGE_GAP_MS) {
+            flush()
+            currentKind = kind
+        }
+        bucket += line
+    }
+    flush()
+    return output
+}
+
+private const val TIMELINE_MERGE_GAP_MS = 10 * 60_000L
+
+/** 类型视图仍保留：导出报告"按类型归类"段落和技术排查场景使用。 */
 internal fun explainedLogGroups(lines: List<ModuleLogParser.Line>): List<ExplainedLogGroup> = lines
     .distinctBy { it.raw }.sortedBy { it.stamp }.groupBy { interpretLogEvent(it).kind }
     .values.map { ExplainedLogGroup(interpretLogEvent(it.last()), it) }

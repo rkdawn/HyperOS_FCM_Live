@@ -219,7 +219,7 @@ private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit, ex
         val now = sample?.nowMs ?: System.currentTimeMillis()
         log?.lines.orEmpty().filter { ModuleLogParser.epochMillis(it)?.let { time -> time in (now - days * 86_400_000)..now } == true }
     }
-    val groups = remember(recent) { explainedLogGroups(recent) }
+    val groups = remember(recent) { explainedTimeline(recent) }
     val counts = remember(recent) { ModuleLogParser.gateCounts(recent) }
     val version = remember { UpdateChecker.localVersionTag(context) }
     val report = remember(data, actionResult, error, windows, bound) { buildString {
@@ -230,12 +230,13 @@ private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit, ex
         actionResult?.let { appendLine("最近主动操作：$it") }
         appendLine("一、先看检查结论")
         primaryStatus(sample, log, bound).forEach { appendLine("${it.title}：${it.detail}") }
-        appendLine("二、日志大白话解读（最近 500 条记录按类型归类）")
-        val explanations = explainedLogGroups(log?.lines.orEmpty().takeLast(500))
-        if (explanations.isEmpty()) appendLine("暂时没有可解读的模块日志，不代表没有收到推送。")
-        explanations.forEach { group ->
-            appendLine("【${group.explanation.title}】${group.records.size} 条记录，最近 ${group.records.last().stamp}")
-            appendLine(group.explanation.text)
+        appendLine("二、日志时间线（按时间顺序，相邻同类合并；最多最近 500 条）")
+        val timeline = explainedTimeline(log?.lines.orEmpty().takeLast(500))
+        if (timeline.isEmpty()) appendLine("暂时没有可解读的模块日志，不代表没有收到推送。")
+        timeline.forEach { group ->
+            val span = if (group.records.size > 1) "${group.records.first().stamp.take(11)} 至 ${group.records.last().stamp.take(11)}，共 ${group.records.size} 条"
+            else group.records.first().stamp.take(11)
+            appendLine("[$span] ${group.explanation.summary}")
         }
         appendLine("三、排查明细（不需要逐行阅读）")
         statusItems(sample, log, bound).forEach { appendLine("${it.title} [${it.verdict.label}]：${it.detail}") }
@@ -305,27 +306,33 @@ private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit, ex
                     }
                 }
             }
-            item("history-toggle") { SectionToggle("日志解读：24 小时 / 3 天 / 7 天", showHistory) { showHistory = !showHistory } }
+            item("history-toggle") { SectionToggle("日志时间线：24 小时 / 3 天 / 7 天", showHistory) { showHistory = !showHistory } }
             if (showHistory) {
                 item("windows") {
                     Row(Modifier.fillMaxWidth()) { listOf("24 小时", "3 天", "7 天").forEach { label ->
                         TextButton(onClick = { selectedWindow = label }, modifier = Modifier.weight(1f)) { Text(if (label == selectedWindow) "✓ $label" else label) }
                     } }
-                    Note("下面把模块的运行日志翻成大白话，帮你判断要不要操作。只分析实际采到的记录，没有记录不等于没收到通知。")
+                    Note("按时间顺序显示模块做了什么。相邻同类合并成一段；点按看这一段的开头时间和原始日志。没有记录不等于没收到通知。")
                     selectedStats?.let {
                         Note(if (it.totalGates == 0) "$selectedWindow 内，日志没有记到模块放行推送请求的过程，不能据此判断没收到消息。"
                             else "$selectedWindow 内，有 ${it.totalGates} 条模块帮助放行推送请求的记录，不是收到通知的次数。")
-                        Note("目前只在 ${it.coveredDays} 个日期留有记录，不代表整段时间都监测到了。\n最早：${it.firstStamp ?: "无"}；最新：${it.lastStamp ?: "无"}")
+                        Note("目前只在 ${it.coveredDays} 个日期留有记录，不代表整段时间都监测到了。")
                     }
                     if (selectedStats == null) Note("尚无可按日期统计的记录。")
                 }
-                items(groups, key = { "event-${it.explanation.kind}" }) { group ->
-                    var expanded by remember(group.explanation.kind) { mutableStateOf(false) }
+                items(groups, key = { "timeline-${groups.indexOf(it)}" }) { group ->
+                    var expanded by remember(group.records.firstOrNull()?.raw) { mutableStateOf(false) }
+                    val first = group.records.first()
                     GroupRow(true, true, onClick = { expanded = !expanded }) {
-                        Text(group.explanation.title, style = MaterialTheme.typography.titleMedium)
-                        Text(group.explanation.text, style = MaterialTheme.typography.bodyMedium)
-                        Text("同类记录 ${group.records.size} 条 · 最近 ${group.records.last().stamp}\n点按${if (expanded) "收起" else "查看原始日志（可不看）"}", style = MaterialTheme.typography.labelMedium)
-                        if (expanded) group.records.takeLast(3).forEach { Text(it.raw, style = MaterialTheme.typography.bodySmall) }
+                        Text("${first.stamp.take(11)}　${group.explanation.summary}", style = MaterialTheme.typography.bodyMedium)
+                        if (group.records.size > 1) {
+                            Text("直到 ${group.records.last().stamp.take(11)}，共 ${group.records.size} 条", style = MaterialTheme.typography.labelMedium)
+                        }
+                        Text("点按${if (expanded) "收起" else "查看影响与原始日志"}", style = MaterialTheme.typography.labelMedium)
+                        if (expanded) {
+                            Text(group.explanation.text, style = MaterialTheme.typography.bodySmall)
+                            group.records.takeLast(3).forEach { Text(it.raw, style = MaterialTheme.typography.bodySmall) }
+                        }
                     }
                 }
             }
