@@ -337,7 +337,7 @@ private fun DiagnosticsScreen(onBack: () -> Unit, onExport: (String) -> Unit, ex
                 }
                 sample?.processRows?.let { rows -> item("processes-all") { DetailCard("所有已确认的谷歌进程", rows.joinToString("\n") { it.display }) } }
             }
-            item("privacy") { Note("报告含应用包名和网络地址，分享前请检查。不会自动上传，也没有新增常驻监控。") }
+            item("privacy") { Note("报告含应用包名和网络地址，分享前请检查。不会自动上传；后台恢复使用事件检查和低频复查，不是全天连续监测。") }
         }
     }
 }

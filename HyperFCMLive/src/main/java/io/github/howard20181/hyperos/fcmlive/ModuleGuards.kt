@@ -5,6 +5,10 @@ internal object ModuleGuards {
     fun authorizedSender(senderUid: Int, moduleUid: Int?): Boolean =
         senderUid in setOf(0, 1000, 2000) || (moduleUid != null && senderUid == moduleUid)
 
+    fun authorizedRecoverySender(senderUid: Int, senderPackage: String?, powerKeeperUid: Int?): Boolean =
+        senderUid >= 1000 && senderUid / 100000 == 0 && senderUid == powerKeeperUid &&
+            senderPackage == "com.miui.powerkeeper"
+
     fun validUser(userId: Int): Boolean = userId in 0..21473
 
     fun mayWriteUser(targetUser: Int, senderUid: Int, hasCrossUserPermission: Boolean): Boolean =

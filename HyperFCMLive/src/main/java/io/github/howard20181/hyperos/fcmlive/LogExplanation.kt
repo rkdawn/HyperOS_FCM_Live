@@ -25,6 +25,17 @@ private val changedRows = Regex("\\bcount=(\\d+)\\b")
 
 internal fun interpretLogEvent(line: ModuleLogParser.Line): LogExplanation {
     val m = line.message
+    if (m.startsWith("recovery:")) return explainRecovery(m)
+    if (m.startsWith("freeze-guard:")) return if (m.startsWith("freeze-guard: request-suppressed")) LogExplanation(
+        "freeze-request", "拦下了一次冻结谷歌服务的请求", "模块阻止了这一次针对谷歌服务的冻结请求。",
+        "只证明这条路径被拦下，不代表所有冻结路径都有效。", "一般不用操作；夜间通知延迟时保留这条记录。")
+    else LogExplanation("freeze-decision", "系统查询时给谷歌服务免冻待遇", "模块在一次省电判断中返回了谷歌服务的豁免结果。",
+        "这是判断过程，不代表刚刚发生过冻结或解冻。", "无需操作；排查时再对照实际冻结记录。")
+    if (m.startsWith("MILLET_NO_RESTRICT_APP: repair")) return if (m.trim() == "MILLET_NO_RESTRICT_APP: repair repaired") LogExplanation(
+        "freeze-list-verified", "保护名单已补回并复查", "补入谷歌服务后，重新读取确认名单包含它并保留了原有条目。",
+        "只确认这项名单，不保证网络已经恢复。", "通常不用操作，连接恢复会另行检查。")
+    else LogExplanation("freeze-list-unconfirmed", "保护名单这次没能确认修好", "读取、写入或回读确认有一步未完成。",
+        "不会因此宣称修复成功，也不会仅凭这条记录请求重连。", "如果反复出现或通知有问题，导出报告。", true)
     if (line.level in setOf("E", "F") || failedWord.containsMatchIn(m)) return LogExplanation(
         "failure", "有一项操作没完成", "模块在执行某一步时记录了失败。",
         "这一步的结果没确认，不等于整个模块都失效。", "如果反复出现或通知有问题，导出报告排查。", true)
@@ -97,6 +108,27 @@ internal fun interpretLogEvent(line: ModuleLogParser.Line): LogExplanation {
         else -> LogExplanation("routine", "一条例行运行信息", "模块记录了一次检查或运行过程。",
             "这条信息本身不能说明推送成功或失败。", "通常不用处理；排查时保留原文即可。")
     }
+}
+
+private fun explainRecovery(message: String): LogExplanation = when {
+    message.startsWith("recovery: request-sent") -> LogExplanation("recovery-requested", "已尝试让谷歌服务恢复连接",
+        "模块根据连接检查或明确的保护修复事件，发出了一次重连请求。", "请求发出不等于恢复成功，稍后会再看连接。", "先稍等，不要连续手动重连。")
+    message.startsWith("recovery: connection-present") -> LogExplanation("recovery-present", "这次检查发现推送端口连接",
+        "检查时发现了谷歌服务已建立的推送端口连接。", "这次不需要继续请求重连；仍不能证明每条消息都已送达。", "通知正常就无需操作。")
+    message.startsWith("recovery: request-failed") || message.startsWith("recovery: check-failed") -> LogExplanation(
+        "recovery-failed", "这次连接检查或恢复请求没完成", "模块没有完成这一步操作。", "不会把失败算成连接已恢复。", "反复出现且通知有问题时导出报告。", true)
+    message.startsWith("recovery: retry-limit") -> LogExplanation("recovery-limited", "这轮自动恢复已停止重试",
+        "这轮恢复已达到三次尝试上限。", "不再不断发送请求，以免增加耗电或反复重建连接。", "检查网络或代理，再用官方连接记录排查。", true)
+    message.startsWith("recovery: network-offline") || message.startsWith("recovery: network-changed") -> LogExplanation(
+        "recovery-network", "网络尚不可用或正在切换", "网络条件还不适合发送恢复请求。", "模块不会因为暂时断网就反复重连。", "先让网络恢复，再观察通知。")
+    message.startsWith("recovery: network-callback-unavailable") -> LogExplanation("recovery-callback", "暂时无法监听网络切换",
+        "系统没有接受网络变化监听。", "仍会低频复查，但可能无法及时发现刚发生的切换。", "如果网络切换后经常收不到消息，导出报告排查。")
+    message.startsWith("recovery: ineligible") -> LogExplanation("recovery-ineligible", "这个用户的谷歌服务暂不自动处理",
+        "应用状态或用户解锁条件没有满足自动恢复要求。", "不会默认改为操作主用户，也不会强行启用已禁用的服务。", "需要时核对对应用户空间的应用状态。")
+    message.startsWith("recovery: compatibility-") -> LogExplanation("recovery-compatibility", "这次兼容恢复没有继续重试",
+        "系统策略事件触发的单次恢复已结束，或被冷却时间限制。", "不是恢复成功的通知，也不会在状态未知时一直重试。", "如仍有延迟，检查实际消息和官方连接记录。")
+    else -> LogExplanation("recovery-unavailable", "自动连接检查暂时拿不到可靠依据",
+        "宿主没能确认网络、用户身份或连接数据。", "读不到不等于掉线；通用自动恢复不会据此触发。", "已有系统保护仍保留，需要排查时手动运行 Root 检查。")
 }
 
 private fun explainTraffic(message: String): LogExplanation {

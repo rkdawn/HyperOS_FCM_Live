@@ -644,12 +644,17 @@ class Hooker : XposedModule() {
     private val registrationWorkerStarted = AtomicBoolean(false)
     @Volatile private var registrationThread: Thread? = null
     @Volatile private var wifiRetryThread: Thread? = null
+    @Volatile private var gmsRecovery: GmsRecoveryController? = null
+    @Volatile private var maintenanceHandler: Handler? = null
+    private val maintenanceQueued = AtomicBoolean(false)
+    private val milletRepairQueued = AtomicBoolean(false)
 
     private fun retireOwnedResources() {
         val handlers = synchronized(workerLock) {
             retired = true
-            listOfNotNull(allowlistHandler, probeHandler)
+            listOfNotNull(allowlistHandler, probeHandler, maintenanceHandler)
         }
+        gmsRecovery?.close()
         registrationThread?.interrupt()
         wifiRetryThread?.interrupt()
         // 系统 IPC 必须在模块锁外执行，避免与 AMS 广播锁反向获取。
@@ -1634,48 +1639,9 @@ class Hooker : XposedModule() {
             }
             chain.proceed()
             if (!enabling) {
-                if (sGmsKeptOnSleepWhitelist) {
-                    // GMS was on the sleep whitelist, so it stayed online and its
-                    // MCS connection is healthy. The recovery broadcasts make GMS
-                    // drop its current MCS — sending them here would tear down the
-                    // very connection the whitelist protected all night.
-                    //
-                    // The flag only proves the *uid rule* was applied, and the
-                    // step from there to "the link stayed up" is a generation
-                    // assumption: true on V816 (where this whole path is dead
-                    // anyway), but a ROM that both whitelists uids and cuts the
-                    // radios in PowerKeeper would satisfy the flag while the
-                    // link was down. The line names the assumption rather than
-                    // leaving it to be re-derived; the cross-generation gap is
-                    // tracked in HOOKS_AND_DIAGNOSTICS.md §3.8.6.
-                    log(
-                        Log.INFO, TAG,
-                        "Sleep mode exited: GMS was kept on the whitelist, " +
-                            "skipping recovery nudge (MCS untouched; assumes the " +
-                            "whitelist path means no radio was cut — on a ROM that " +
-                            "also cuts them in PowerKeeper this skip is wrong)"
-                    )
-                } else {
-                    log(
-                        Log.INFO, TAG,
-                        "Sleep mode exited: GMS not whitelisted (network was cut), " +
-                            "nudging GMS to reconnect"
-                    )
-                    val context = getSystemContext()
-                    if (context != null) {
-                        // Sample before the nudge: those broadcasts make GMS drop its
-                        // current MCS connection, so the pre-nudge state is what tells
-                        // us whether the nudge broke a connection that was still alive.
-                        probeGmsTraffic("before sleep-exit nudge")
-                        Thread { recoverGmsConnection(context) }.start()
-                        probeBackgroundHandler()?.postDelayed(
-                            { probeGmsTraffic("after sleep-exit nudge") },
-                            GMS_TRAFFIC_NUDGE_RESAMPLE_MS
-                        )
-                    }
-                }
-                // Next session starts from a clean slate: the flag must reflect
-                // what happens in *that* session, not a stale previous one.
+                // 名单不是连接证据：先检查。仅旧路径原本需要恢复时保留兼容触发。
+                automaticRecovery()?.request(if (sGmsKeptOnSleepWhitelist) GmsRecoveryController.Trigger.PERIODIC
+                    else GmsRecoveryController.Trigger.SLEEP_EXIT)
                 sGmsKeptOnSleepWhitelist = false
             }
         }
@@ -2942,6 +2908,7 @@ class Hooker : XposedModule() {
             )
             hookE(getNoRestrictAppsMethod).intercept { chain: XposedInterface.Chain ->
                 val result = chain.proceed()
+                requestGmsMaintenance()
                 try {
                     if (result is MutableList<*>) {
                         @Suppress("UNCHECKED_CAST")
@@ -2953,11 +2920,6 @@ class Hooker : XposedModule() {
                     }
                 } catch (t: Throwable) {
                     log(Log.ERROR, TAG, "Failed to extend getNoRestrictApps", t)
-                }
-                try {
-                    ensureGmsUserTableBgControl()
-                } catch (t: Throwable) {
-                    log(Log.WARN, TAG, "Failed to write back userTable.bgControl", t)
                 }
                 result
             }
@@ -3009,11 +2971,7 @@ class Hooker : XposedModule() {
                         }
                     }
                     val result = if (args != null) chain.proceed(args) else chain.proceed()
-                    try {
-                        ensureGmsUserTableBgControl()
-                    } catch (t: Throwable) {
-                        log(Log.WARN, TAG, "userTable re-assert after ${method.name} failed", t)
-                    }
+                    requestGmsMaintenance()
                     result
                 }
                 deoptimize(method)
@@ -3040,11 +2998,7 @@ class Hooker : XposedModule() {
             )
             hookE(dealNoRestrictAppMethod).intercept { chain: XposedInterface.Chain ->
                 chain.proceed()
-                try {
-                    ensureGmsInMilletSetting()
-                } catch (t: Throwable) {
-                    log(Log.ERROR, TAG, "Failed to repair MILLET_NO_RESTRICT_APP", t)
-                }
+                requestGmsMaintenance(repairMillet = true)
             }
             deoptimize(dealNoRestrictAppMethod)
         } catch (e: NoSuchMethodException) {
@@ -3069,23 +3023,28 @@ class Hooker : XposedModule() {
      * was before installing it. Keep it that way: a new write has to justify
      * itself against this list.
      */
+    /**
+     * [MilletRepair.ensure] performs read/write/verify with strict parsing;
+     * only a verified repair triggers the internal check request. The runtime
+     * cache consumes [Settings.System] writes, so the broadcast targets the
+     * framework's receiver with shared identity (same pattern as Prefs), and
+     * the receiver re-checks the real PowerKeeper identity before acting.
+     */
     private fun ensureGmsInMilletSetting() {
-        ensureGmsUserTableBgControl()
-        val context = getSystemContext() ?: getPowerKeeperContext() ?: return
+        if (retired) return
+        val context = getPowerKeeperContext() ?: return
         val resolver = context.contentResolver
-        val raw = android.provider.Settings.System.getString(resolver, MILLET_NO_RESTRICT_APP_KEY)
-            ?: ""
-        val entries = raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
-        if (entries.contains(GMS_PACKAGE_NAME)) return
-        val updated = if (entries.isEmpty()) {
-            GMS_PACKAGE_NAME
-        } else {
-            entries.joinToString(", ") + ", " + GMS_PACKAGE_NAME
+        val result = MilletRepair.ensure(
+            read = { android.provider.Settings.System.getString(resolver, MILLET_NO_RESTRICT_APP_KEY) },
+            write = { value -> !retired && android.provider.Settings.System.putString(resolver, MILLET_NO_RESTRICT_APP_KEY, value) }
+        )
+        if (retired || result.status == MilletRepair.Status.UNCHANGED) return
+        log(if (result.status == MilletRepair.Status.REPAIRED) Log.INFO else Log.WARN, TAG,
+            "MILLET_NO_RESTRICT_APP: repair ${result.status.name.lowercase()}")
+        if (result.status == MilletRepair.Status.REPAIRED) {
+            val options = android.app.BroadcastOptions.makeBasic().setShareIdentityEnabled(true)
+            context.sendBroadcast(Intent(GmsRecoveryController.ACTION_CHECK).setPackage("android"), null, options.toBundle())
         }
-        android.provider.Settings.System.putString(resolver, MILLET_NO_RESTRICT_APP_KEY, updated)
-        log(Log.INFO, TAG, "MILLET_NO_RESTRICT_APP: appended GMS (was: $raw)")
-        // P4: if GMS was frozen during the missing-entry window, nudge it awake.
-        recoverGmsConnection(context)
     }
 
     /**
@@ -3098,7 +3057,7 @@ class Hooker : XposedModule() {
      * Only the GMS row is touched; other packages keep whatever the user set.
      */
     private fun ensureGmsUserTableBgControl() {
-        if (userTableReassertInFlight) return
+        if (retired || userTableReassertInFlight) return
         userTableReassertInFlight = true
         try {
             val pk = getPowerKeeperContext()
@@ -3128,7 +3087,7 @@ class Hooker : XposedModule() {
                 return
             }
             log(Log.INFO, TAG, "userTable: GMS current bgControl=$current")
-            if (current == BG_CONTROL_NO_RESTRICT) return
+            if (retired || current == BG_CONTROL_NO_RESTRICT) return
 
             val values = android.content.ContentValues()
             values.put(COL_BG_CONTROL, BG_CONTROL_NO_RESTRICT)
@@ -3144,6 +3103,7 @@ class Hooker : XposedModule() {
             } catch (t: Throwable) {
                 log(Log.WARN, TAG, "userTable: update failed", t)
             }
+            if (retired) return
             values.put(COL_PKG_NAME, GMS_PACKAGE_NAME)
             values.put(COL_USER_ID, 0)
             values.put(COL_LAST_CONFIGURED, System.currentTimeMillis())
@@ -3160,36 +3120,40 @@ class Hooker : XposedModule() {
         }
     }
 
-    /**
-     * P4: ask GMS/GSF to re-establish its FCM connection and un-freeze.
-     *
-     * All actions are outbound IPC TO GMS/GSF (broadcasts + content query),
-     * not hooks inside GMS. Inspired by FCMGuard's heartbeat approach:
-     * GCM_RECONNECT alone may miss the MCS/GTalk reconnect paths on some
-     * builds, so GTALK_HEARTBEAT and MCS_HEARTBEAT are also sent. GSF
-     * (com.google.android.gsf) participates in the FCM transport chain
-     * alongside GMS and is included as a target.
-     */
-    private fun recoverGmsConnection(context: Context) {
-        for (target in arrayOf(GMS_PACKAGE_NAME, GSF_PACKAGE_NAME)) {
-            for (action in RECOVERY_BROADCAST_ACTIONS) {
-                try {
-                    val intent = Intent(action)
-                    intent.setPackage(target)
-                    context.sendBroadcast(intent)
-                } catch (t: Throwable) {
-                    log(Log.WARN, TAG, "Failed to send $action to $target", t)
-                }
+    /** 写入和回读不放在系统的查询/广播热路径内；短时间的重复请求合并。 */
+    private fun requestGmsMaintenance(repairMillet: Boolean = false) {
+        if (retired) return
+        if (repairMillet) milletRepairQueued.set(true)
+        if (!maintenanceQueued.compareAndSet(false, true)) return
+        val handler = synchronized(workerLock) {
+            if (retired) null else maintenanceHandler ?: HandlerThread("fcmlive-gms-maintenance").let { thread ->
+                thread.start()
+                Handler(thread.looper).also { maintenanceHandler = it }
             }
         }
-        log(Log.INFO, TAG, "P4: recovery broadcasts sent to GMS+GSF")
-        try {
-            val uri = android.net.Uri.parse(CHIMERA_PROVIDER_URI)
-            val cursor = context.contentResolver.query(uri, null, null, null, null)
-            cursor?.close()
-            log(Log.INFO, TAG, "Chimera provider query completed")
-        } catch (t: Throwable) {
-            log(Log.WARN, TAG, "Chimera provider query failed (non-fatal)", t)
+        val queued = handler?.postDelayed({
+            try {
+                if (!retired) ensureGmsUserTableBgControl()
+                if (!retired && milletRepairQueued.getAndSet(false)) ensureGmsInMilletSetting()
+            } catch (e: Exception) {
+                log(Log.WARN, TAG, "GMS maintenance failed", e)
+            } finally {
+                maintenanceQueued.set(false)
+                if (!retired && milletRepairQueued.get()) requestGmsMaintenance(repairMillet = true)
+            }
+        }, 400L) == true
+        if (!queued) maintenanceQueued.set(false)
+    }
+
+    private fun automaticRecovery(): GmsRecoveryController? {
+        val handler = probeBackgroundHandler() ?: return null
+        return synchronized(workerLock) {
+            if (retired) null else gmsRecovery ?: GmsRecoveryController(
+                context = ::getSystemContext,
+                handler = handler,
+                ownerActive = { !retired },
+                logger = { level, message -> log(level, TAG, message) }
+            ).also { gmsRecovery = it }
         }
     }
 
@@ -3295,6 +3259,25 @@ class Hooker : XposedModule() {
      * hooked — only the framework-side freeze policy is told to treat GMS as
      * no-restrict.
      */
+    private val freezeEvidenceAt = mutableMapOf<String, Long>()
+
+    private fun noteGmsFreezeDecision(path: String, uid: Int?, requestSuppressed: Boolean, reason: Any? = null) {
+        if (retired) return
+        val key = "$path:${uid ?: -1}"
+        val now = SystemClock.elapsedRealtime()
+        val report = synchronized(freezeEvidenceAt) {
+            val previous = freezeEvidenceAt[key]
+            if (previous != null && now - previous < GMS_TRAFFIC_PROBE_INTERVAL_MS) false
+            else {
+                if (freezeEvidenceAt.size >= 64) freezeEvidenceAt.clear()
+                freezeEvidenceAt[key] = now
+                true
+            }
+        }
+        if (report) log(Log.INFO, TAG, "freeze-guard: ${if (requestSuppressed) "request-suppressed" else "exemption-decision"} " +
+            "path=$path uid=${uid ?: "unknown"} reason=${reason ?: "unknown"}")
+    }
+
     private fun hookGreezerNoRestrict(classLoader: ClassLoader) {
         // Primary: isNoRestrictApp(pkg) — boolean, no constant guessing needed.
         // Returning true means "GMS is in the no-restrict set", so every freeze
@@ -3310,6 +3293,7 @@ class Hooker : XposedModule() {
                 hookE(isNoRestrictAppMethod).intercept { chain: XposedInterface.Chain ->
                     val pkg = chain.getArg(0)
                     if (GMS_PACKAGE_NAME == pkg) {
+                        noteGmsFreezeDecision("isNoRestrictApp", null, false)
                         return@intercept true
                     }
                     chain.proceed()
@@ -3327,6 +3311,7 @@ class Hooker : XposedModule() {
                 hookE(isNoRestrictFreezeableMethod).intercept { chain: XposedInterface.Chain ->
                     val pkg = chain.getArg(0)
                     if (GMS_PACKAGE_NAME == pkg) {
+                        noteGmsFreezeDecision("isNoRestrictFreezeable", null, false, chain.getArg(1))
                         return@intercept false
                     }
                     chain.proceed()
@@ -3348,6 +3333,7 @@ class Hooker : XposedModule() {
                     hookE(method).intercept { chain: XposedInterface.Chain ->
                         val uid = chain.getArg(0)
                         if (uid is Int && isGmsUid(uid)) {
+                            noteGmsFreezeDecision("triggerQuickFreeze", uid, true, chain.getArg(1))
                             return@intercept skipValueFor(method.returnType)
                         }
                         chain.proceed()
@@ -3379,6 +3365,7 @@ class Hooker : XposedModule() {
                     hookE(method).intercept { chain: XposedInterface.Chain ->
                         val uid = chain.getArg(0)
                         if (uid is Int && isGmsUid(uid)) {
+                            noteGmsFreezeDecision("isAllowFreeze", uid, false)
                             return@intercept skipValueFor(method.returnType)
                         }
                         chain.proceed()
@@ -3637,13 +3624,9 @@ class Hooker : XposedModule() {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
                     if (retired) return
-                    // This receiver *has* to be RECEIVER_EXPORTED: it lives on
-                    // the system_server context and the only legitimate sender —
-                    // the settings app — is a different uid, so a non-exported
-                    // registration would never receive anything. Being exported
-                    // with no broadcast permission also means any app on the
-                    // device can reach these two actions, so the sender is
-                    // checked in the callback instead of at registration time.
+                    // 配置应用与 PowerKeeper 是跨进程发送者，接收器必须 exported。
+                    // 配置动作沿用原鉴权；恢复动作只接受系统核实的 PowerKeeper 身份。
+                    // 不信任 Intent 自报的包名、UID 或目标用户，也不互相借用权限。
                     val fromPackage = try {
                         sentFromPackage
                     } catch (t: Throwable) {
@@ -3653,6 +3636,15 @@ class Hooker : XposedModule() {
                         sentFromUid
                     } catch (t: Throwable) {
                         Process.INVALID_UID
+                    }
+                    if (intent.action == GmsRecoveryController.ACTION_CHECK) {
+                        val powerKeeperUid = runCatching {
+                            context.packageManager.getApplicationInfo(GmsRecoveryController.POWERKEEPER, 0).uid
+                        }.getOrNull()
+                        if (ModuleGuards.authorizedRecoverySender(fromUid, fromPackage, powerKeeperUid)) {
+                            automaticRecovery()?.request(GmsRecoveryController.Trigger.POLICY_REPAIRED)
+                        }
+                        return
                     }
                     if (allowlistSenderIsForeign(fromPackage, fromUid)) {
                         logForeignAllowlistSenderOnce(fromPackage, fromUid)
@@ -3666,6 +3658,7 @@ class Hooker : XposedModule() {
             }
             val filter = IntentFilter(Prefs.ACTION_ALLOWLIST_CHANGED)
             filter.addAction(Prefs.ACTION_APPLY_AUTOSTART)
+            filter.addAction(GmsRecoveryController.ACTION_CHECK)
             val handler = allowlistBackgroundHandler() ?: return false
             sys.registerReceiver(receiver, filter, null, handler, Context.RECEIVER_EXPORTED)
             registeredAllowlistReceiver.set(Pair.create(sys, receiver))
@@ -3675,6 +3668,7 @@ class Hooker : XposedModule() {
             }
             allowlistReceiverRegistered = true
             log(Log.INFO, TAG, "Allowlist receiver installed")
+            automaticRecovery()?.request(GmsRecoveryController.Trigger.PERIODIC)
             return true
         } catch (e: Throwable) {
             // The boot retry loop reports only its final attempt, so it stays
@@ -4422,6 +4416,7 @@ class Hooker : XposedModule() {
      */
     private fun startGmsTrafficProbe() {
         if (retired) return
+        automaticRecovery()?.start()
         // Claim the latest chain generation before scheduling: on every hot
         // reload hookPackage re-runs and a fresh module classloader brings a
         // fresh companion, so a plain field cannot be seen by chains scheduled
@@ -4488,6 +4483,8 @@ class Hooker : XposedModule() {
             "uid=$uid ${trafficSinceLastProbe(uid)}"
         }
         log(Log.INFO, TAG, "gms probe [$reason]: $traffic; ${broadcastGateSummary()}")
+        // 复用调度触发有限连接检查；上面的流量数值本身不作为重连判据。
+        automaticRecovery()?.request(GmsRecoveryController.Trigger.PERIODIC)
     }
 
     /**
@@ -5347,7 +5344,6 @@ class Hooker : XposedModule() {
          */
         private const val SLEEP_EARTHQUAKE_KEY = "key_open_earthquake_warning"
         private const val GMS_TRAFFIC_PROBE_INTERVAL_MS = 30 * 60_000L
-        private const val GMS_TRAFFIC_NUDGE_RESAMPLE_MS = 15_000L
 
         /** java.util.System property key holding the latest probe chain generation. */
         private const val TRAFFIC_PROBE_GENERATION_KEY = "hyperfcmlive.trafficProbe.generation"
@@ -5384,18 +5380,6 @@ class Hooker : XposedModule() {
         /** P3 scenario constants (from live PowerKeeper dumps). */
         private const val SCENARIO_MUI_AUTO_GMS = 0   // isGmsCoreApp + miuiAuto
         private const val SCENARIO_NO_RESTRICT = 8    // bgControl = noRestrict
-
-        /** P4 recovery actions (outbound IPC to GMS/GSF, not hooks). */
-        private const val ACTION_GCM_RECONNECT = "com.google.android.intent.action.GCM_RECONNECT"
-        private const val ACTION_GTALK_HEARTBEAT = "com.google.android.intent.action.GTALK_HEARTBEAT"
-        private const val ACTION_MCS_HEARTBEAT = "com.google.android.intent.action.MCS_HEARTBEAT"
-        private const val GSF_PACKAGE_NAME = "com.google.android.gsf"
-        private val RECOVERY_BROADCAST_ACTIONS = arrayOf(
-            ACTION_GCM_RECONNECT,
-            ACTION_GTALK_HEARTBEAT,
-            ACTION_MCS_HEARTBEAT
-        )
-        private const val CHIMERA_PROVIDER_URI = "content://com.google.android.gms.chimera"
 
         private const val ALLOWLIST_STALE_MS = 10_000L
         private const val ALLOWLIST_FAILURE_BACKOFF_BASE_MS = 1_000L

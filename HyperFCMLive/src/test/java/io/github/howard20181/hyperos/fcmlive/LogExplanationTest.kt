@@ -61,6 +61,35 @@ class LogExplanationTest {
         assertTrue(interpretLogEvent(line("read operation", level = "E")).needsAttention)
     }
 
+    @Test fun recoveryRequestIsNotDeliveryAndUnknownIsNotOffline() {
+        val requested = interpretLogEvent(line("recovery: request-sent uid=10132 mode=confirmed-absence"))
+        val present = interpretLogEvent(line("recovery: connection-present uid=10132"))
+        val unknown = interpretLogEvent(line("recovery: observation-unavailable uid=10132"))
+        assertTrue(requested.impact.contains("不等于恢复成功"))
+        assertTrue(present.impact.contains("不能证明每条消息"))
+        assertTrue(unknown.impact.contains("读不到不等于掉线"))
+        assertTrue(interpretLogEvent(line("recovery: retry-limit uid=10132")).needsAttention)
+        assertTrue(interpretLogEvent(line("recovery: request-failed uid=10132")).needsAttention)
+    }
+
+    @Test fun freezeDecisionAndActualSuppressionStaySeparate() {
+        val decision = interpretLogEvent(line("freeze-guard: exemption-decision path=isAllowFreeze uid=10132"))
+        val suppressed = interpretLogEvent(line("freeze-guard: request-suppressed path=triggerQuickFreeze uid=10132"))
+        assertNotEquals(decision.kind, suppressed.kind)
+        assertTrue(decision.impact.contains("不代表刚刚发生"))
+        assertTrue(suppressed.impact.contains("不代表所有冻结路径"))
+    }
+
+    @Test fun milletRepairRequiresConfirmedOutcome() {
+        val verified = interpretLogEvent(line("MILLET_NO_RESTRICT_APP: repair repaired"))
+        val failed = interpretLogEvent(line("MILLET_NO_RESTRICT_APP: repair write_failed"))
+        val unknown = interpretLogEvent(line("MILLET_NO_RESTRICT_APP: repair unconfirmed"))
+        assertNotEquals(verified.kind, failed.kind)
+        assertFalse(verified.needsAttention)
+        assertTrue(failed.needsAttention)
+        assertTrue(unknown.needsAttention)
+    }
+
     @Test fun groupingDeduplicatesButDoesNotMixOutcomes() {
         val a = line("userTable: update before -> noRestrict count=0", 1)
         val b = line("userTable: update before -> noRestrict count=1", 2)
